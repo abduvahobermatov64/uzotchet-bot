@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: uzotchet-bot
+    env: python
+    region: oregon
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    autoDeploy: true
