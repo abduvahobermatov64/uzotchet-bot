@@ -1,0 +1,1744 @@
+import os
+import json
+import sys
+import logging
+import io
+import csv
+import asyncio
+import uuid # Для генерации уникальных ID для каждой отправки груза
+import re
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove, InputMediaPhoto
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ConversationHandler,
+    ContextTypes,
+    filters,
+    PicklePersistence # Для сохранения данных бота
+)
+from telegram.constants import ParseMode, ChatMemberStatus
+from datetime import datetime, timedelta 
+from typing import Optional, List, Dict, Any
+# Определяем префикс для файлов на основе имени скрипта
+SCRIPT_NAME = os.path.basename(sys.argv[0]).split('.')[0]
+FILE_PREFIX = f"{SCRIPT_NAME}_"
+
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    # Используем уникальное имя для лог-файла
+    filename=f'{FILE_PREFIX}bot_log.txt'
+)
+logger = logging.getLogger(__name__)
+
+# Список ID администраторов
+ADMIN_IDS = {1423619368,8122604388, 433749443}  # Супер Админ - ЗАМЕНИТЕ
+REGULAR_ADMIN_IDS = {5495465770,82291313,556616030} # Просто Админ - ЗАМЕНИТЕ (может быть несколько ID через запятую)
+
+# ID или username канала для проверки членства.
+# Если ID числовой (для частных каналов), он должен быть без кавычек. Например: -1001234567890
+# Если это username (для публичных каналов), он должен быть в кавычках. Например: "@mychannel"
+REQUIRED_CHANNEL_ID ="" # ЗАМЕНИТЕ на ID или @username. Если оставить "", проверка не будет производиться.
+
+# Состояния
+class States:
+    IDLE = 'IDLE'
+    AWAITING_NAME = 'AWAITING_NAME'
+    AWAITING_SURNAME = 'AWAITING_SURNAME'
+    AWAITING_DEPARTMENT = 'AWAITING_DEPARTMENT'
+    AWAITING_POSITION = 'AWAITING_POSITION'
+    AWAITING_PHOTO = 'AWAITING_PHOTO'
+    AWAITING_DOCS = 'AWAITING_DOCS'
+    # AWAITING_QUESTION, AWAITING_ANSWER - УДАЛЕНЫ
+    AWAITING_WORKSHOP = 'AWAITING_WORKSHOP'
+    AWAITING_RECEIVING_PLACE = 'AWAITING_RECEIVING_PLACE'
+    AWAITING_RECEPTION_TYPE = 'AWAITING_RECEPTION_TYPE'
+    AWAITING_GOODS_SUBTYPE = 'AWAITING_GOODS_SUBTYPE' # Новый статус для подтипов
+    AWAITING_REJECTION_REASON = 'AWAITING_REJECTION_REASON'
+
+ALLOWED_DOCUMENT_TYPES = {
+    'pdf', 'doc', 'docx', 'xls', 'xlsx', 'jpg', 'jpeg', 'png', 'bmp',
+    'txt', 'csv', 'zip', 'rar', '7z', 'ppt', 'pptx', 'rtf'
+}
+REQUIRED_DOCUMENTS = [
+    "📄 Договор", 
+    "📋 Сертификат", 
+    "📑 Паспорт товара", 
+    "📦 ТТН",
+    "🔖 Счет-фактура", 
+    "📝 ТЗ", 
+    "📋 Заявка цеха" 
+    ]
+
+RECEPTION_TYPES_KEYBOARD_MAPPING = {
+    "goods": "Оборудование и материалы", "raw": "Сырье",
+    "ppe": "Средства индивидуальной защиты (СИЗ)" }
+
+# Новые маппинги для подтипов "Оборудование и материалы"
+GOODS_SUBTYPES_KEYBOARD_MAPPING = {
+    "electric": "Электрики",
+    "mechanic": "Механики",
+    "hydraulic": "Гидравлики"
+}
+
+# Старая комиссия для "Оборудование и материалы" больше не используется напрямую
+# COMMISSION_GOODS_IDS: set[int] = {5495465770} 
+COMMISSION_RAW_MATERIALS_IDS: set[int] = {1423619368,22256770,1408639216} 
+COMMISSION_PPE_IDS: set[int] = {5495465770, 1423619368,518696046,82291313} 
+
+# ЗАМЕНИТЕ ID на реальные ID членов комиссий
+COMMISSION_GOODS_ELECTRIC_IDS: set[int] = {1423619368,22256770,1408639216} # Пример: ID для комиссии электриков
+COMMISSION_GOODS_MECHANIC_IDS: set[int] = {1423619368,82291313,1408639216} # Пример: ID для комиссии механиков
+COMMISSION_GOODS_HYDRAULIC_IDS: set[int] = {1423619368,518696046,82291313} # Пример: ID для комиссии гидравликов
+ALL_COMMISSIONS_BY_KEY: Dict[str, set[int]] = {
+    "raw": COMMISSION_RAW_MATERIALS_IDS,
+    "ppe": COMMISSION_PPE_IDS,
+    "goods_electric": COMMISSION_GOODS_ELECTRIC_IDS,
+    "goods_mechanic": COMMISSION_GOODS_MECHANIC_IDS,
+    "goods_hydraulic": COMMISSION_GOODS_HYDRAULIC_IDS,
+}
+
+# --- Функции для работы с данными ---
+def load_data(filename: str, default_data: Optional[Any] = None) -> Any:
+    if default_data is None:
+        default_data = []
+    try:
+        if not os.path.exists(filename):
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(default_data, f, ensure_ascii=False, indent=4)
+            return default_data
+        with open(filename, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e: logger.error(f"Ошибка загрузки {filename}: {e}"); return default_data
+
+def save_data(filename: str, data_to_save: Any) -> None:
+    try:
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(data_to_save, f, ensure_ascii=False, indent=4)
+    except Exception as e: logger.error(f"Ошибка сохранения {filename}: {e}")
+
+def load_users() -> List[Dict[str, Any]]: return load_data(f'{FILE_PREFIX}users.json', [])
+def save_users(users: List[Dict[str, Any]]) -> None: save_data(f'{FILE_PREFIX}users.json', users)
+# load_questions и save_questions УДАЛЕНЫ
+
+# --- Вспомогательные функции ---
+def get_user_info(user_id: int) -> Optional[Dict[str, Any]]:
+    for user_rec in load_users():
+        if user_rec.get('user_id') == user_id: return user_rec
+    return None
+
+def is_admin(user_id: int) -> bool: # Супер Админ
+    try: return int(user_id) in ADMIN_IDS
+    except ValueError: return False
+
+def is_regular_admin(user_id: int) -> bool: # Просто Админ
+    try: return int(user_id) in REGULAR_ADMIN_IDS
+    except ValueError: return False
+
+def get_user_state(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> Optional[str]: # user_id добавлен для совместимости с логами, но не используется для получения состояния
+    return context.user_data.get('state') if context.user_data else None
+
+def set_user_state(context: ContextTypes.DEFAULT_TYPE, user_id: int, state: str) -> None: # user_id добавлен для совместимости с логами
+    if context.user_data is None:
+        context.user_data = {}
+    logger.info(f"User {user_id} state -> {state}")
+    context.user_data['state'] = state
+
+def clear_user_state(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
+    # Глобальные словари больше не используются, все хранится в context.user_data
+    keys_to_clear = ['state', 
+                     'registration_data', # Основные ключи для очистки
+                     'receiving_place', 'documents', 'current_doc_type', 'photo_id', 'photos',
+                     # 'messages_to_delete' удален из очистки, так как он управляется delete_dialogue_messages
+                     'photo_time', 'workshop', 'reception_type_name', 'goods_subtype_name', 'messages_to_delete',
+                     'reception_type_key', 'photo_datetime_obj', 'rejecting_shipment_id', 'last_bot_message_id']
+    if context.user_data:
+        for key in keys_to_clear: context.user_data.pop(key, None)
+    logger.info(f"State and user_data cleared for user {user_id}.")
+
+def _add_msg_to_delete(context: ContextTypes.DEFAULT_TYPE, message_id: int):
+    """Добавляет ID сообщения в список для последующего удаления."""
+    if context.user_data is None: context.user_data = {}
+    if 'messages_to_delete' not in context.user_data:
+        context.user_data['messages_to_delete'] = []
+    context.user_data['messages_to_delete'].append(message_id)
+    logger.debug(f"Added message {message_id} to delete list.") # Добавлено для отладки
+
+async def delete_dialogue_messages(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    """Удаляет все сообщения, сохраненные в списке 'messages_to_delete'."""
+    if context.user_data and 'messages_to_delete' in context.user_data:
+        for msg_id in context.user_data['messages_to_delete']:
+            try: await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+            except Exception as e: logger.warning(f"Не удалось удалить сообщение {msg_id} в чате {chat_id}: {e}")
+        context.user_data['messages_to_delete'] = [] # Очищаем список после удаления
+
+async def delete_message_after_delay(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, delay_seconds: int = 15):
+    """Удаляет сообщение через указанное количество секунд."""
+    async def delete_task():
+        try:
+            await asyncio.sleep(delay_seconds)
+            await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except Exception as e:
+            logger.warning(f"Не удалось удалить сообщение {message_id} в чате {chat_id} через {delay_seconds} сек: {e}")
+    # Запускаем задачу в фоне, не ждем её завершения
+    asyncio.create_task(delete_task())
+
+# --- Основные обработчики ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        effective_user = update.effective_user
+        if not effective_user: logger.warning("start: effective_user is None"); return
+        user_id = effective_user.id
+        
+        if REQUIRED_CHANNEL_ID and REQUIRED_CHANNEL_ID.strip(): # Проверка, что ID/username канала не пустой
+            try:
+                member_status = (await context.bot.get_chat_member(chat_id=REQUIRED_CHANNEL_ID, user_id=user_id)).status
+                allowed_statuses = [ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR, ChatMemberStatus.OWNER]
+                if member_status not in allowed_statuses:
+                    logger.info(f"User {user_id} не участник канала {REQUIRED_CHANNEL_ID}. Статус: {member_status}")
+                    if update.message: 
+                        await update.message.reply_text(
+                            f"❌ Для использования этого бота вы должны быть участником канала {REQUIRED_CHANNEL_ID}.\n"
+                            "Присоединитесь и попробуйте /start снова."
+                        )
+                    return
+                logger.info(f"User {user_id} участник канала {REQUIRED_CHANNEL_ID}. Статус: {member_status}")
+            except Exception as e_channel_check:
+                logger.error(f"Ошибка проверки членства {user_id} в {REQUIRED_CHANNEL_ID}: {e_channel_check}")
+                if update.message: await update.message.reply_text("⚠️ Ошибка проверки членства в канале. Попробуйте позже.")
+                return
+        
+        user_json_data = get_user_info(user_id)
+
+        if not user_json_data:
+            reg_kb_layout = [[InlineKeyboardButton("✅ Зарегистрироваться", callback_data='start_register')],
+                             [InlineKeyboardButton("❌ Отмена", callback_data='cancel_register')]]
+            if update.message: 
+                await update.message.reply_text(
+                    "🌟 *Добро пожаловать в систему учета грузов!* \n"
+                     "━━━━━━━━━━━━━━━━━━━━━  \n"
+                    "🔐 *Необходима регистрация*  \n"
+                    "📝 Вам потребуется указать:  \n"
+                    "• 👤 Имя  \n"
+                    "• 👥 Фамилию  \n"
+                    "• 🏢 Отдел/Цех  \n"
+                    "• 💼 Должность  \n"
+                    "🤝 Присоединяйтесь к нашей системе!  \n"
+                    "━━━━━━━━━━━━━━━━━━━━━", reply_markup=InlineKeyboardMarkup(reg_kb_layout), parse_mode=ParseMode.MARKDOWN)
+            return
+
+        dept = user_json_data.get('department', 'Н/У'); pos = user_json_data.get('position', 'Н/У')
+        display_name = user_json_data.get('first_name', effective_user.first_name or "Пользователь")
+
+        reply_kb_buttons: List[List[KeyboardButton]] = []
+        is_super = is_admin(user_id); is_reg_adm = is_regular_admin(user_id)
+
+        if is_super or is_reg_adm: # Супер Админ и Просто Админ видят кнопку "Отправить фото"
+            reply_kb_buttons.append([KeyboardButton("📸 Отправить фото груза")])
+        
+        admin_row1: List[KeyboardButton] = []
+        admin_row2: List[KeyboardButton] = []
+        if is_super: # Кнопки только для Супер Админа
+            admin_row1.append(KeyboardButton("👥 Список участников"))
+            admin_row1.append(KeyboardButton("🛡️ Состав комиссий"))
+            if admin_row1: reply_kb_buttons.append(admin_row1)
+            
+            admin_row2.append(KeyboardButton("📊 Отчет по грузам"))
+            if admin_row2: reply_kb_buttons.append(admin_row2)
+        
+        reply_kb_markup: Any = ReplyKeyboardRemove() # По умолчанию убираем клавиатуру
+        if reply_kb_buttons: # Если есть хоть какие-то кнопки
+            reply_kb_markup = ReplyKeyboardMarkup(reply_kb_buttons, resize_keyboard=True, one_time_keyboard=False)
+        
+        welcome_msg = (f"🌟 *Добро пожаловать!* \n👤 *Профиль:*\n • Имя: {display_name}\n"
+                       f" • Отдел/Цех: {dept}\n • Должность: {pos}\n")
+        if reply_kb_buttons: welcome_msg += f"📱 *Доступные действия:*\n"
+        welcome_msg += "━━━━━━━━━━━━━━━━━━━━━"
+        set_user_state(context, user_id, States.IDLE)
+        if update.message: await update.message.reply_text(welcome_msg, reply_markup=reply_kb_markup, parse_mode=ParseMode.MARKDOWN)
+
+    except Exception as e:
+        logger.error(f"Ошибка в start: {e}", exc_info=True)
+        if update.message: await update.message.reply_text("❌ Ошибка при запуске. Попробуйте позже.", parse_mode=ParseMode.MARKDOWN)
+        if update.effective_user: clear_user_state(context, update.effective_user.id)
+        # (Продолжение файла uz3_bot.py - Часть 7)
+
+async def handle_registration_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.from_user: return
+    await query.answer()
+    user_id = query.from_user.id
+    if query.data == 'start_register':
+        if context.user_data is None: context.user_data = {}
+        context.user_data.setdefault('registration_data', {})
+        await query.edit_message_text(text="👤 Пожалуйста, введите ваше *имя*:", parse_mode=ParseMode.MARKDOWN)
+        set_user_state(context, user_id, States.AWAITING_NAME)
+    elif query.data == 'cancel_register':
+        await query.edit_message_text(text="❌ Регистрация отменена. /start для возобновления.", parse_mode=ParseMode.MARKDOWN)
+        clear_user_state(context, user_id)
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        if not update.message or not update.message.text or not update.effective_user: return
+
+        # Проверяем, что сообщение пришло в личном чате. Если нет - игнорируем.
+        # ВАЖНО: Если бот должен работать в группах, эту проверку нужно убрать.
+        if update.message.chat.type != 'private':
+            return
+
+        msg_user = update.effective_user
+        user_id = msg_user.id
+        text_msg = update.message.text
+
+        if context.user_data is None: context.user_data = {}
+        current_state = get_user_state(context, user_id) # Передаем user_id
+
+        _add_msg_to_delete(context, update.message.message_id)
+
+        if current_state == States.AWAITING_NAME:
+            context.user_data.setdefault('registration_data', {})['first_name'] = text_msg
+            bot_msg = await update.message.reply_text("👤 Ваша *фамилия*:", parse_mode=ParseMode.MARKDOWN)
+            if bot_msg: _add_msg_to_delete(context, bot_msg.message_id)
+            set_user_state(context, user_id, States.AWAITING_SURNAME)
+        elif current_state == States.AWAITING_SURNAME:
+            context.user_data.setdefault('registration_data', {})['last_name'] = text_msg
+            bot_msg = await update.message.reply_text("🏢 Ваш *отдел или цех* (например, Склад, ОЗ):", parse_mode=ParseMode.MARKDOWN)
+            if bot_msg: _add_msg_to_delete(context, bot_msg.message_id)
+            set_user_state(context, user_id, States.AWAITING_DEPARTMENT)
+        elif current_state == States.AWAITING_DEPARTMENT:
+            context.user_data.setdefault('registration_data', {})['department'] = text_msg
+            bot_msg = await update.message.reply_text("💼 Ваша *должность* (например, Кладовщик, Специалист):", parse_mode=ParseMode.MARKDOWN)
+            if bot_msg: _add_msg_to_delete(context, bot_msg.message_id)
+            set_user_state(context, user_id, States.AWAITING_POSITION)
+        elif current_state == States.AWAITING_POSITION:
+            reg_data = context.user_data.get('registration_data', {})
+            reg_data['position'] = text_msg
+
+            new_user_entry = {
+                'user_id': user_id,
+                'first_name': reg_data.get('first_name', msg_user.first_name or " "),
+                'last_name': reg_data.get('last_name', msg_user.last_name or " "),
+                'username': msg_user.username or "",
+                'department': reg_data.get('department', 'Не указан'),
+                'position': reg_data.get('position', 'Не указана'),
+                'registration_date': datetime.now().strftime("%d.%m.%Y %H:%M")
+            }
+            users_data_list = load_users()
+            # Обновляем или добавляем пользователя
+            users_data_list = [u for u in users_data_list if u.get('user_id') != user_id]
+            users_data_list.append(new_user_entry)
+            save_users(users_data_list)
+            
+            await delete_dialogue_messages(context, user_id)
+            
+            bot_msg = await update.message.reply_text(
+                f"✅ *Регистрация успешна!*\n👤 Имя: {new_user_entry['first_name']}\n👤 Фамилия: {new_user_entry['last_name']}\n"
+                f"🏢 Отдел: {new_user_entry['department']}\n💼 Должность: {new_user_entry['position']}\n"
+                f"Используйте /start для начала работы.", parse_mode=ParseMode.MARKDOWN )
+            clear_user_state(context, user_id)
+            await start(update, context)
+            return # type: ignore
+        elif current_state == States.AWAITING_WORKSHOP:
+            context.user_data['workshop'] = text_msg 
+            bot_msg = await update.message.reply_text("🏭 *Место приёмки товара:*", parse_mode=ParseMode.MARKDOWN)
+            if bot_msg: _add_msg_to_delete(context, bot_msg.message_id)
+            set_user_state(context, user_id, States.AWAITING_RECEIVING_PLACE)
+        elif current_state == States.AWAITING_RECEIVING_PLACE:
+            context.user_data['receiving_place'] = text_msg 
+            reception_kb_buttons = [] 
+            for key_rt, display_text_rt in RECEPTION_TYPES_KEYBOARD_MAPPING.items(): # type: ignore
+                reception_kb_buttons.append([InlineKeyboardButton(display_text_rt, callback_data=f"reception_type_{key_rt}")])
+            bot_msg = await update.message.reply_text("📋 *Тип принимаемого груза:*", reply_markup=InlineKeyboardMarkup(reception_kb_buttons), parse_mode=ParseMode.MARKDOWN)
+            if bot_msg: _add_msg_to_delete(context, bot_msg.message_id)
+            set_user_state(context, user_id, States.AWAITING_RECEPTION_TYPE)
+        elif current_state == States.IDLE or current_state is None:
+            is_super = is_admin(user_id)
+            is_reg_adm = is_regular_admin(user_id)
+
+            if text_msg == "📸 Отправить фото груза": # Доступно Супер Админу и Просто Админу
+                if not (is_super or is_reg_adm): # Проверка, что это один из админов
+                     user_json_info = get_user_info(user_id) # Обычному пользователю нужна регистрация
+                     if not user_json_info:
+                        await update.message.reply_text("🔐 Для отправки фото зарегистрируйтесь (/start).", parse_mode=ParseMode.MARKDOWN); return # type: ignore
+                bot_msg = await update.message.reply_text(
+                    "📸 *Пожалуйста, отправьте фотографию груза.*\n\n"
+                    "💡 *Вы можете отправить несколько фото* - после каждого фото вам будет предложено добавить еще одно или продолжить.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                if bot_msg: _add_msg_to_delete(context, bot_msg.message_id)
+                set_user_state(context, user_id, States.AWAITING_PHOTO)
+            # "Задать вопрос" и "История вопросов" УДАЛЕНЫ
+            elif text_msg == "👥 Список участников" and is_super:
+                await view_users(update, context)
+            elif text_msg == "🛡️ Состав комиссий" and is_super:
+                await view_commission_members_from_config(update, context)
+            elif text_msg == "📊 Отчет по грузам" and is_super:
+                await generate_cargo_report(update, context)
+            else: 
+                user_info_idle = get_user_info(user_id)
+                if user_info_idle: # Если зарегистрирован, но нажал не свою кнопку или просто текст
+                     await update.message.reply_text('Используйте доступные вам кнопки меню или команду /start. Если хотите написать сообщение, перейдите на Telegram-канал "Группа по приёмке 2 ТМЦ АО УМК".', parse_mode=ParseMode.MARKDOWN)
+                # Если не зарегистрирован (но прошел проверку канала на этапе /start), то /start уже должен был предложить регистрацию.
+                # Можно добавить else: await start(update, context) если нужно еще раз показать сообщение /start
+        # Состояние AWAITING_REJECTION_REASON обрабатывается ConversationHandler
+        elif current_state != States.AWAITING_REJECTION_REASON: 
+             await update.message.reply_text("Пожалуйста, завершите текущую операцию или используйте /cancel.", parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        logger.error(f"Ошибка в handle_message: {e}", exc_info=True)
+        if update.message: await update.message.reply_text("❌ Ошибка обработки сообщения.", parse_mode=ParseMode.MARKDOWN)
+        if update.effective_user: clear_user_state(context, update.effective_user.id)
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        if not update.message or not update.message.photo or not update.effective_user: return
+        user_id = update.effective_user.id
+        
+        if context.user_data is None: context.user_data = {}
+        photo_state = get_user_state(context, user_id) # Передаем user_id
+
+        _add_msg_to_delete(context, update.message.message_id)
+
+        if photo_state != States.AWAITING_PHOTO:
+            await update.message.reply_text("⚠️ *Действие невозможно*. Сначала '📸 Отправить фото груза'.", parse_mode=ParseMode.MARKDOWN); return
+
+        user_json_photo = get_user_info(user_id)
+        # Разрешаем отправку фото Супер Админам и Просто Админам, даже если их нет в users.json (на случай если они не регистрировались через бота)
+        # Обычным пользователям нужна запись в users.json (т.е. регистрация)
+        if not user_json_photo and not (is_admin(user_id) or is_regular_admin(user_id)):
+            await update.message.reply_text("❌ *Ошибка доступа*. Для отправки фото зарегистрируйтесь (/start).", parse_mode=ParseMode.MARKDOWN); return
+
+        photo_obj = update.message.photo[-1]
+        
+        # Инициализируем список фото, если его еще нет
+        if 'photos' not in context.user_data:
+            context.user_data['photos'] = []
+            context.user_data['photo_time'] = datetime.now().strftime('%d.%m.%Y %H:%M')
+            context.user_data['photo_datetime_obj'] = datetime.now()
+        
+        # Добавляем новое фото в список
+        context.user_data['photos'].append(photo_obj.file_id)
+        
+        photo_count = len(context.user_data['photos'])
+        
+        # Создаем клавиатуру для выбора: добавить еще фото или продолжить
+        photo_kb_buttons = [
+            [InlineKeyboardButton("📸 Добавить еще фото", callback_data="add_more_photos")],
+            [InlineKeyboardButton("✅ Завершить и продолжить", callback_data="finish_photos")]
+        ]
+        reply_markup_photos = InlineKeyboardMarkup(photo_kb_buttons)
+        
+        bot_msg = await update.message.reply_text(
+            f"✅ *Фото {photo_count} добавлено*\n\n"
+            f"📸 Всего фото: {photo_count}\n\n"
+            f"Вы можете добавить еще фото или продолжить заполнение карточки груза.",
+            reply_markup=reply_markup_photos,
+            parse_mode=ParseMode.MARKDOWN
+        )
+        if bot_msg: _add_msg_to_delete(context, bot_msg.message_id)
+        # Остаемся в состоянии AWAITING_PHOTO, чтобы можно было добавить еще фото
+    except Exception as e:
+        logger.error(f"Ошибка в handle_photo: {e}", exc_info=True)
+        if update.message: await update.message.reply_text("❌ *Ошибка обработки фото*.", parse_mode=ParseMode.MARKDOWN)
+        if update.effective_user: clear_user_state(context, update.effective_user.id)
+
+async def handle_reception_type_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.from_user or not query.data : return
+    await query.answer()
+    user_id = query.from_user.id
+    if context.user_data is None: context.user_data = {}
+
+    if query.message: _add_msg_to_delete(context, query.message.message_id) # type: ignore
+    cb_data_parts = query.data.split("reception_type_")
+    if len(cb_data_parts) < 2:
+        if query.message: await query.edit_message_text("Ошибка выбора типа. Попробуйте снова.")
+        return
+
+    selected_reception_key = cb_data_parts[1]
+    chosen_reception_display_name = RECEPTION_TYPES_KEYBOARD_MAPPING.get(selected_reception_key)
+
+    if not chosen_reception_display_name:
+        if query.message: await query.edit_message_text("Неверный тип приемки. Попробуйте снова.")
+        return
+    
+    context.user_data['reception_type_name'] = chosen_reception_display_name
+    
+    # Если выбран тип "Оборудование и материалы", запрашиваем подтип
+    if selected_reception_key == "goods":
+        context.user_data['reception_type_key'] = "goods" # Временно сохраняем основной ключ
+        
+        subtype_kb_buttons = []
+        for key_st, display_text_st in GOODS_SUBTYPES_KEYBOARD_MAPPING.items():
+            subtype_kb_buttons.append([InlineKeyboardButton(display_text_st, callback_data=f"goods_subtype_{key_st}")])
+        
+        await query.edit_message_text(f"✅ Выбран тип: *{chosen_reception_display_name}*\n\nТеперь выберите направление:", 
+                                      reply_markup=InlineKeyboardMarkup(subtype_kb_buttons), 
+                                      parse_mode=ParseMode.MARKDOWN)
+        set_user_state(context, user_id, States.AWAITING_GOODS_SUBTYPE)
+        return
+    else: # Для остальных типов ("Сырье", "СИЗ") логика остается прежней
+        context.user_data['reception_type_key'] = selected_reception_key # Сохраняем ключ "raw", "ppe"
+        if query.message:
+            await query.edit_message_text(f"✅ Выбран тип приемки: *{chosen_reception_display_name}*", parse_mode=ParseMode.MARKDOWN)
+
+    doc_options_inline_kb = [[
+        InlineKeyboardButton("📎 Добавить документы", callback_data="add_docs"),
+        InlineKeyboardButton("✅ Отправить без документов", callback_data="send_now") ]]
+    reply_markup_doc_options_inline = InlineKeyboardMarkup(doc_options_inline_kb)
+    
+    await context.bot.send_message(chat_id=user_id, text="Добавить сопроводительные документы?",
+                                   reply_markup=reply_markup_doc_options_inline, parse_mode=ParseMode.MARKDOWN)
+    set_user_state(context, user_id, States.AWAITING_DOCS)
+
+async def handle_goods_subtype_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обрабатывает выбор подтипа для 'Оборудование и материалы'."""
+    query = update.callback_query
+    if not query or not query.from_user or not query.data: return
+    await query.answer()
+    user_id = query.from_user.id
+    if context.user_data is None: context.user_data = {} # type: ignore
+
+    if query.message: _add_msg_to_delete(context, query.message.message_id)
+    cb_data_parts = query.data.split("goods_subtype_")
+    if len(cb_data_parts) < 2:
+        if query.message: await query.edit_message_text("Ошибка выбора направления. Попробуйте снова.")
+        return
+
+    selected_subtype_key = cb_data_parts[1]
+    chosen_subtype_name = GOODS_SUBTYPES_KEYBOARD_MAPPING.get(selected_subtype_key)
+
+    if not chosen_subtype_name:
+        if query.message: await query.edit_message_text("Неверное направление. Попробуйте снова.")
+        return
+
+    # Сохраняем название подтипа и формируем составной ключ для комиссии
+    context.user_data['goods_subtype_name'] = chosen_subtype_name
+    context.user_data['reception_type_key'] = f"goods_{selected_subtype_key}" # -> "goods_electric", "goods_mechanic" и т.д.
+
+    await query.edit_message_text(f"✅ Направление: *{chosen_subtype_name}*", parse_mode=ParseMode.MARKDOWN)
+
+    # Переходим к шагу добавления документов
+    await show_doc_options(user_id, context) # type: ignore
+
+async def handle_photo_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обрабатывает выбор пользователя: добавить еще фото или завершить"""
+    query = update.callback_query
+    if not query or not query.from_user or not query.data: return
+    await query.answer()
+    user_id = query.from_user.id
+    if context.user_data is None: context.user_data = {}
+    
+    if query.message: _add_msg_to_delete(context, query.message.message_id)
+    
+    if query.data == "add_more_photos":
+        # Остаемся в состоянии AWAITING_PHOTO для добавления еще фото
+        await query.edit_message_text(
+            "📸 *Отправьте следующее фото груза*\n\n"
+            "Вы можете отправить еще одно или несколько фото.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    elif query.data == "finish_photos":
+        # Переходим к следующему шагу - запрос цеха
+        photos = context.user_data.get('photos', [])
+        if not photos:
+            await query.edit_message_text("❌ *Ошибка*: Нет сохраненных фото. Попробуйте снова.", parse_mode=ParseMode.MARKDOWN)
+            return
+        
+        await query.edit_message_text(
+            f"✅ *Фото сохранены*\n📸 Всего фото: {len(photos)}\n\n"
+            "Продолжаем заполнение карточки груза...",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        bot_msg = await context.bot.send_message(
+            chat_id=user_id,
+            text="🏭 *Для какого цеха/проекта этот груз?*",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        if bot_msg: _add_msg_to_delete(context, bot_msg.message_id)
+        set_user_state(context, user_id, States.AWAITING_WORKSHOP)
+
+async def handle_docs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        if not update.effective_user: return
+        doc_event_user_id = update.effective_user.id
+        if context.user_data is None: context.user_data = {}
+
+        if update.callback_query:
+            query = update.callback_query
+            if not query.data or not query.message : return
+            await query.answer()
+            callback_query_data = query.data
+            _add_msg_to_delete(context, query.message.message_id)
+
+            if callback_query_data == "send_now":
+                await query.edit_message_text("Готовим информацию (фото)...")
+                await send_cargo_info(update, context, only_photo=True); return
+            elif callback_query_data == "add_docs":
+                doc_sel_kb = []
+                row = []
+                for i, name in enumerate(REQUIRED_DOCUMENTS):
+                    row.append(InlineKeyboardButton(name, callback_data=f"doc_{i}"))
+                    if len(row) == 2:
+                        doc_sel_kb.append(row)
+                        row = []
+                if row: doc_sel_kb.append(row)
+                doc_sel_kb.append([InlineKeyboardButton("✅ Завершить и отправить", callback_data="finish_and_send")]) # Эта кнопка в отдельном ряду
+                context.user_data['documents'] = []
+                await query.edit_message_text("📎 *Документы:* Выберите тип:", reply_markup=InlineKeyboardMarkup(doc_sel_kb), parse_mode=ParseMode.MARKDOWN )
+                set_user_state(context, doc_event_user_id, States.AWAITING_DOCS); return
+            # (Остальная часть handle_docs с обработкой callback_query)
+# (Продолжение файла uz3_bot.py - Часть 3)
+
+            # (Продолжение elif query_data_val == "finish_and_send": из handle_docs)
+            elif callback_query_data == "finish_and_send":
+                if not context.user_data.get('documents'):
+                    await query.answer("Вы не прикрепили ни одного документа!", show_alert=True)
+                    doc_sel_kb_no_docs_finish = []; row = []
+                    for i, name in enumerate(REQUIRED_DOCUMENTS):
+                        row.append(InlineKeyboardButton(name, callback_data=f"doc_{i}"))
+                        if len(row) == 2:
+                            doc_sel_kb_no_docs_finish.append(row)
+                            row = []
+                    if row: doc_sel_kb_no_docs_finish.append(row)
+                    doc_sel_kb_no_docs_finish.append([InlineKeyboardButton("✅ Завершить и отправить", callback_data="finish_and_send")])
+
+                    reply_markup_doc_sel_no_docs_finish = InlineKeyboardMarkup(doc_sel_kb_no_docs_finish)
+                    try:
+                        await query.edit_message_text("❌ *Нет документов!*\nВыберите тип или завершите:",reply_markup=reply_markup_doc_sel_no_docs_finish, parse_mode=ParseMode.MARKDOWN)
+                    except Exception: # type: ignore
+                         await query.message.reply_text("❌ *Нет документов!*\nВыберите тип или завершите:",reply_markup=reply_markup_doc_sel_no_docs_finish, parse_mode=ParseMode.MARKDOWN)
+                    return
+
+                confirm_kb_layout = [[InlineKeyboardButton("✅ Да", callback_data="confirm_send")],[InlineKeyboardButton("❌ Нет", callback_data="cancel_send")]]
+                reply_markup_confirm_final = InlineKeyboardMarkup(confirm_kb_layout)
+
+                sender_info_docs_prev = get_user_info(doc_event_user_id)
+                department_docs_prev = sender_info_docs_prev.get('department', 'Н/У') if sender_info_docs_prev else 'Н/У'
+                reception_type_preview = context.user_data.get('reception_type_name', 'Н/У')
+
+                preview_text_final = "📋 *Проверка перед отправкой:*\n"
+                preview_text_final += f"🏢 Отправитель: {department_docs_prev}\n"
+                preview_text_final += f"🏭 Цех: {context.user_data.get('workshop', 'Н/У')}\n"
+                preview_text_final += f"📍 Место: {context.user_data.get('receiving_place', 'Н/У')}\n"
+                preview_text_final += f"📋 Тип: {reception_type_preview}\n"
+                preview_text_final += "📸 Фото (будет отправлено)\n"
+                current_docs_for_preview = context.user_data.get('documents', [])
+                if current_docs_for_preview:
+                    preview_text_final += "📎 *Документы:*\n"
+                    for doc_data_item_prev in current_docs_for_preview: # type: ignore
+                        preview_text_final += f"• {doc_data_item_prev.get('type','N/A')}: {doc_data_item_prev.get('file_name','N/A')}\n"
+                if len(preview_text_final) > 4000: preview_text_final = preview_text_final[:3990] + "...(обр.)"
+                
+                await query.edit_message_text( f"{preview_text_final}\nОтправить информацию?", 
+                                              reply_markup=reply_markup_confirm_final, parse_mode=ParseMode.MARKDOWN)
+                return
+            elif callback_query_data == "confirm_send":
+                await query.edit_message_text("Отправляем...") # type: ignore
+                await send_cargo_info(update, context, only_photo=False)
+                return
+            elif callback_query_data == "cancel_send":
+                await query.edit_message_text("❌ Отправка отменена. /start для начала.", parse_mode=ParseMode.MARKDOWN)
+                clear_user_state(context, doc_event_user_id); return
+            elif callback_query_data.startswith("doc_"):
+                idx = int(callback_query_data.split('_')[1]) # type: ignore
+                if 0 <= idx < len(REQUIRED_DOCUMENTS):
+                    context.user_data['current_doc_type'] = REQUIRED_DOCUMENTS[idx]
+                    msg_txt = f"📎 Отправьте файл для *{REQUIRED_DOCUMENTS[idx]}*\n(Форматы: {', '.join(ALLOWED_DOCUMENT_TYPES)})"
+                    try: await query.edit_message_text(msg_txt, parse_mode=ParseMode.MARKDOWN) # type: ignore
+                    except Exception: await query.message.reply_text(msg_txt, parse_mode=ParseMode.MARKDOWN) # Fallback
+                    set_user_state(context, doc_event_user_id, States.AWAITING_DOCS)
+                else: await query.answer("Неверный тип.", show_alert=True)
+                return
+        elif update.message and update.message.document: # Пользователь отправил файл документа
+            _add_msg_to_delete(context, update.message.message_id)
+
+            state = get_user_state(context, doc_event_user_id)
+            if state != States.AWAITING_DOCS or not context.user_data.get('current_doc_type'):
+                await update.message.reply_text("❌ Сначала выберите тип документа кнопкой.", parse_mode=ParseMode.MARKDOWN); return
+            
+            doc_file = update.message.document; ext = ""; 
+            if doc_file.file_name and '.' in doc_file.file_name: ext = doc_file.file_name.split('.')[-1].lower()
+            if ext not in ALLOWED_DOCUMENT_TYPES: await update.message.reply_text(f"❌ *Формат {ext} не разрешен!*", parse_mode=ParseMode.MARKDOWN); return
+            
+            doc_info: Dict[str,str] = {'file_id': doc_file.file_id, 'file_name': doc_file.file_name or "файл", 'type': str(context.user_data.get('current_doc_type','Н/Т'))}
+            if not isinstance(context.user_data.get('documents'), list): context.user_data['documents'] = []
+            context.user_data['documents'].append(doc_info); context.user_data.pop('current_doc_type', None) # type: ignore
+            
+            kb_next = []; row = []
+            for i, name in enumerate(REQUIRED_DOCUMENTS):
+                row.append(InlineKeyboardButton(name, callback_data=f"doc_{i}"))
+                if len(row) == 2:
+                    kb_next.append(row)
+                    row = []
+            if row: kb_next.append(row)
+            kb_next.append([InlineKeyboardButton("✅ Завершить и отправить", callback_data="finish_and_send")])
+
+            bot_msg = await update.message.reply_text(f"✅ Документ *{doc_info['type']}* ({doc_info['file_name']}) добавлен!\nВыберите следующий или завершите:", reply_markup=InlineKeyboardMarkup(kb_next), parse_mode=ParseMode.MARKDOWN) # type: ignore
+            if bot_msg: _add_msg_to_delete(context, bot_msg.message_id)
+    except Exception as e:
+        logger.error(f"Ошибка в handle_docs: {e}", exc_info=True)
+        target = update.effective_message or (update.callback_query.message if update.callback_query else None)
+        if target: await target.reply_text("❌ Ошибка обработки документов.", parse_mode=ParseMode.MARKDOWN)
+        if update.effective_user: clear_user_state(context, update.effective_user.id)
+
+async def show_doc_options(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отправляет кнопки для добавления документов."""
+    doc_options_inline_kb = [[
+        InlineKeyboardButton("📎 Добавить документы", callback_data="add_docs"),
+        InlineKeyboardButton("✅ Отправить без документов", callback_data="send_now") # Callback data для отправки без документов
+    ]]
+    reply_markup_doc_options_inline = InlineKeyboardMarkup(doc_options_inline_kb)    
+    bot_msg = await context.bot.send_message(chat_id=user_id, text="Добавить сопроводительные документы?",
+                                   reply_markup=reply_markup_doc_options_inline, parse_mode=ParseMode.MARKDOWN) # type: ignore
+    if bot_msg: _add_msg_to_delete(context, bot_msg.message_id)
+    set_user_state(context, user_id, States.AWAITING_DOCS)
+
+def _get_document_buttons_for_shipment(shipment_id: str, documents_list: List[Dict[str,str]]) -> List[List[InlineKeyboardButton]]:
+    doc_buttons_rows: List[List[InlineKeyboardButton]] = []
+    if documents_list:
+        row: List[InlineKeyboardButton] = []
+        for idx, doc_info_item in enumerate(documents_list):
+            doc_type_display_btn = doc_info_item.get('type', 'Документ').replace("📄", "").replace("📋", "").strip()
+            button_text_content = f"{doc_type_display_btn}"[:30] # Показываем только тип, чтобы кнопки не были слишком широкими
+            callback_data_doc_btn = f"getdoc_{shipment_id}_{idx}"
+            if len(callback_data_doc_btn) > 64:
+                 logger.warning(f"Слишком длинный callback_data для кнопки документа: {callback_data_doc_btn}")
+            row.append(InlineKeyboardButton(button_text_content, callback_data=callback_data_doc_btn))
+            if len(row) == 2:
+                doc_buttons_rows.append(row)
+                row = []
+        if row: # Если осталось нечетное количество кнопок, добавляем последний ряд
+            doc_buttons_rows.append(row)
+    return doc_buttons_rows
+
+async def send_cargo_info(update: Update, context: ContextTypes.DEFAULT_TYPE, only_photo: bool = False) -> None:
+    sender_user_obj = update.effective_user
+    if not sender_user_obj and update.callback_query:
+        sender_user_obj = update.callback_query.from_user
+ # type: ignore
+    if not sender_user_obj:
+        logger.error("Не удалось определить отправителя в send_cargo_info")
+        effective_message = update.effective_message or (update.callback_query.message if update.callback_query else None)
+        if effective_message: await effective_message.reply_text("Не удалось определить отправителя."); return
+    try:
+        if context.user_data is None: context.user_data = {}
+        if context.bot_data is None: context.bot_data = {}
+            
+        sender_db_record = get_user_info(sender_user_obj.id)
+        sender_name_cargo, department_name_cargo, position_name_cargo = "Неизвестный", "Н/У", "Н/У"
+        if sender_db_record:
+            sender_name_parts_db = [n for n in [sender_db_record.get('first_name'), sender_db_record.get('last_name')] if n]
+            sender_name_cargo = " ".join(sender_name_parts_db).strip() or f"ID {sender_user_obj.id}"
+            department_name_cargo = sender_db_record.get('department', 'Н/У'); position_name_cargo = sender_db_record.get('position', 'Н/У') # type: ignore
+        elif sender_user_obj.first_name: 
+            sender_name_parts_tg = [n for n in [sender_user_obj.first_name, sender_user_obj.last_name] if n]
+            sender_name_cargo = " ".join(sender_name_parts_tg).strip() or f"User ID {sender_user_obj.id}"
+
+        workshop_name = context.user_data.get('workshop', 'Н/У'); receiving_place = context.user_data.get('receiving_place', 'Н/У')
+        
+        # Получаем список фото (поддержка нескольких фото)
+        photos_list = context.user_data.get('photos', [])
+        # Для обратной совместимости проверяем старое поле photo_id
+        if not photos_list:
+            old_photo_id = context.user_data.get('photo_id')
+            if old_photo_id:
+                photos_list = [old_photo_id]
+        
+        photo_time_str = str(context.user_data.get('photo_time', datetime.now().strftime('%d.%m.%Y %H:%M')))
+        photo_dt_obj = context.user_data.get('photo_datetime_obj', datetime.now())
+        if not isinstance(photo_dt_obj, datetime):
+             try: photo_dt_obj = datetime.strptime(photo_time_str, '%d.%m.%Y %H:%M')
+             except (ValueError, TypeError): photo_dt_obj = datetime.now() 
+        if not photos_list:
+            target_msg = update.effective_message or (update.callback_query.message if update.callback_query else None) # type: ignore
+            if target_msg: await target_msg.reply_text("❌ *Ошибка* Фото не найдено.", parse_mode=ParseMode.MARKDOWN)
+            logger.warning(f"Фото нет для {sender_user_obj.id}."); return
+
+        shipment_id = str(uuid.uuid4())
+        docs_for_shipment: List[Dict[str, str]] = list(context.user_data.get('documents', [])) if not only_photo else [] # type: ignore
+
+        # Формируем упрощенное описание (только ключевые данные: отправитель, цех, дата)
+        caption_parts = [ "📦 *Новый груз!!!!*", "─"*20, f"👤 Отпр: {sender_name_cargo} ({department_name_cargo}, {position_name_cargo})",
+                          f"🏭 Цех: {workshop_name}", f"📅 Дата: {photo_time_str}" ]
+        reception_type_name = context.user_data.get('reception_type_name', 'Н/У')
+        reception_type_key = context.user_data.get('reception_type_key')
+        
+        # Сохраняем тип приемки для внутренней логики, но не отображаем в карточке
+        goods_subtype_name = context.user_data.get('goods_subtype_name', '')
+        full_reception_name = f"{reception_type_name} ({goods_subtype_name})" if goods_subtype_name else reception_type_name
+        
+        main_caption = "  \n".join(caption_parts)
+
+        # Сохраняем первое фото для обратной совместимости и список всех фото
+        first_photo_id = photos_list[0] if photos_list else None
+        shipment_entry: Dict[str, Any] = {
+            'shipment_id': shipment_id, 'photo_id': first_photo_id, 'photos': photos_list, 'caption_text': main_caption, 'documents': docs_for_shipment,
+            'sender_user_id': sender_user_obj.id, 'sender_name': sender_name_cargo, 'workshop': workshop_name, 
+            'receiving_place': receiving_place, 'reception_type_key': reception_type_key, 
+            'photo_time_str': photo_time_str, 'photo_datetime_obj': photo_dt_obj.isoformat(), 
+            'reception_type': full_reception_name, 'status': 'ожидает решения', 'decision_time_obj': None, 
+            'decision_maker_name': None, 'decision_maker_id': None, 'processing_time_str': None, 'sent_messages': {},
+            'commission_notification_messages': {}, 'commission_signing_status': 'not_applicable', 
+            'commission_signatures': {}, 'required_commission_members': [], 'commission_process_initiator_name': None, 
+            'commission_process_initiator_id': None, 'commission_process_initiation_time': None, }
+        context.bot_data.setdefault('shipments', {})[shipment_id] = shipment_entry
+        logger.info(f"Груз {shipment_id} от {sender_user_obj.id} инициализирован.")
+
+        all_users = load_users(); sent_count = 0
+        for user_rec in all_users:
+            user_id_to_send = user_rec.get('user_id')
+            if not user_id_to_send: continue
+            is_super_admin_receiver = is_admin(user_id_to_send)
+            
+            doc_buttons = _get_document_buttons_for_shipment(shipment_id, docs_for_shipment)
+            action_buttons = []
+            if is_super_admin_receiver: # Только Супер Админ видит кнопки действий
+                action_buttons = [
+                    [InlineKeyboardButton("✅ Принято", callback_data=f"cargoaction_{shipment_id}_accepted"),
+                     InlineKeyboardButton("❌ Отказано", callback_data=f"cargoaction_{shipment_id}_rejected")],
+                    [InlineKeyboardButton("🔬 В лабораторию", callback_data=f"cargoaction_{shipment_id}_lab_check")],
+                    [InlineKeyboardButton("🗑️ Удалить (для всех)", callback_data=f"delshipment_{shipment_id}")]]
+            
+            final_buttons = doc_buttons + action_buttons
+            reply_markup_for_receiver: Optional[InlineKeyboardMarkup] = InlineKeyboardMarkup(final_buttons) if final_buttons else None
+
+            try:
+                # Отправляем все фото в медиа-группе (отображаются в одном ряду, компактно)
+                photo_msg_ids = []
+                if len(photos_list) > 1:
+                    # Если несколько фото - используем медиа-группу
+                    media_group = []
+                    for idx, photo_file_id in enumerate(photos_list):
+                        # Первое фото с описанием, остальные без описания
+                        if idx == 0:
+                            media_group.append(InputMediaPhoto(
+                                media=str(photo_file_id),
+                                caption=main_caption,
+                                parse_mode=ParseMode.MARKDOWN
+                            ))
+                        else:
+                            media_group.append(InputMediaPhoto(
+                                media=str(photo_file_id)
+                            ))
+                    
+                    # Отправляем медиа-группу (фото будут в одном ряду, компактно)
+                    sent_messages_group = await context.bot.send_media_group(
+                        chat_id=user_id_to_send,
+                        media=media_group
+                    )
+                    # Сохраняем ID всех сообщений из медиа-группы
+                    photo_msg_ids = [msg.message_id for msg in sent_messages_group]
+                else:
+                    # Если одно фото - отправляем обычным способом
+                    photo_msg = await context.bot.send_photo(
+                        chat_id=user_id_to_send,
+                        photo=str(photos_list[0]),
+                        caption=main_caption,
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                    photo_msg_ids.append(photo_msg.message_id)
+                
+                # Затем, если есть кнопки, отправляем их отдельным сообщением
+                action_msg_id = None # ID сообщения с кнопками
+                if reply_markup_for_receiver:
+                    action_msg = await context.bot.send_message(chat_id=user_id_to_send, text="Спроводительные документы !:", reply_markup=reply_markup_for_receiver)
+                    action_msg_id = action_msg.message_id
+
+                s_dict = context.bot_data.setdefault('shipments', {}); s_entry = s_dict.setdefault(shipment_id, {})
+                sent_m_dict = s_entry.setdefault('sent_messages', {}); 
+                # Сохраняем ID первого фото для обратной совместимости и список всех ID
+                sent_m_dict[str(user_id_to_send)] = {
+                    'photo_msg_id': photo_msg_ids[0] if photo_msg_ids else None, 
+                    'photo_msg_ids': photo_msg_ids,
+                    'action_msg_id': action_msg_id
+                }
+                sent_count += 1
+            except Exception as e: logger.error(f"Ошибка отправки фото груза {user_id_to_send}: {e}"); continue 
+
+            # "Важное уведомление для комиссии" - отправляется ВСЕМ (если есть текст)
+            comm_notify_parts: List[str] = []
+            if reception_type_name and reception_type_name != 'Не указан':
+                comm_notify_parts = [f"🔔 *ВАЖНОЕ УВЕДОМЛЕНИЕ ДЛЯ КОМИССИИ ({str(full_reception_name).upper()})*", "Прошу следующих участников приемной комиссии прибыть в место приемки ", "*" + ("─"*20) + "*", ]
+                s_r_key = shipment_entry.get('reception_type_key')
+                if s_r_key and s_r_key.startswith("goods_"): comm_notify_parts.extend([" • Специалист цеха", " • Специалист (сервиса по направлению)", " • Специалист тех.дирекции", " • Сотрудник СБ", " • Сотрудник СУМЗ" ])
+                elif s_r_key == "raw": comm_notify_parts.extend([" • Специалист цеха", " • Сотрудник СБ", " • Специалист СУМЗ"])
+                elif s_r_key == "ppe": comm_notify_parts.extend([" • Начальник УПБ", " • Начальник ООТ", " • Начальник ЭСПЦ/СПЦ", " • Специалист СБ", " • Специалист профкома", " • Специалист СУМЗ"])
+                else: comm_notify_parts.append(f" (Состав для '{reception_type_name}' не детализирован)")
+                comm_notify_parts.append("*" + ("─"*20) + "*")
+            if comm_notify_parts:
+                final_comm_notify_text = "\n".join(comm_notify_parts)
+                try:
+                    comm_notify_msg = await context.bot.send_message(chat_id=user_id_to_send, text=final_comm_notify_text, parse_mode=ParseMode.MARKDOWN )
+                    s_d_comm = context.bot_data.setdefault('shipments', {}); s_e_c = s_d_comm.setdefault(shipment_id, {}) # type: ignore
+                    c_n_m_s = s_e_c.setdefault('commission_notification_messages', {}); c_n_m_s[user_id_to_send] = comm_notify_msg.message_id # type: ignore
+                except Exception as e: logger.error(f"Ошибка уведомления комиссии {user_id_to_send}: {e}")
+        
+        reply_target_sender = update.effective_message or (update.callback_query.message if update.callback_query else None)
+        if reply_target_sender:
+            success_text = f"✅ Инфо о грузе отправлена ({sent_count} польз.)."
+            if docs_for_shipment: success_text += f"\n📎 Документов для выбора: {len(docs_for_shipment)}"
+            
+            await delete_dialogue_messages(context, sender_user_obj.id)
+
+            if update.callback_query and update.callback_query.message:
+                 success_msg = await context.bot.send_message(chat_id=sender_user_obj.id, text=success_text, parse_mode=ParseMode.MARKDOWN)
+                 # Автоматически удаляем сообщение через 15 секунд
+                 await delete_message_after_delay(context, sender_user_obj.id, success_msg.message_id, 15)
+            elif update.message: 
+                success_msg = await update.message.reply_text(success_text, parse_mode=ParseMode.MARKDOWN)
+                # Автоматически удаляем сообщение через 15 секунд
+                await delete_message_after_delay(context, update.message.chat_id, success_msg.message_id, 15)
+        clear_user_state(context, sender_user_obj.id) # Передаем user_id
+
+    except Exception as e:
+        logger.error(f"Крит. ошибка в send_cargo_info: {e}", exc_info=True)
+        target_crit_err = update.effective_message or (update.callback_query.message if update.callback_query else None)
+        if target_crit_err: await target_crit_err.reply_text("❌ *Крит. ошибка отправки.* Сообщите админу.", parse_mode=ParseMode.MARKDOWN)
+        if sender_user_obj: clear_user_state(context, sender_user_obj.id)
+
+async def get_document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.data or not query.from_user: return
+    await query.answer()
+    try:
+        if context.bot_data is None: context.bot_data = {}
+        parts = query.data.split('_');
+        if len(parts) < 3: 
+            if query.message: await query.message.reply_text("❌ Ошибка: неверные данные."); return
+        prefix, shipment_id, idx_str = parts[0], parts[1], parts[2]; doc_idx = int(idx_str)
+        if prefix == "getdoc":
+            s_data: Dict[str, Dict[str, Any]] = context.bot_data.get('shipments', {})
+            if shipment_id in s_data:
+                s_info = s_data[shipment_id]; docs: List[Dict[str, str]] = s_info.get('documents', []) # type: ignore
+                # Проверяем, что docs является списком и doc_idx находится в допустимых пределах
+                if isinstance(docs, list) and 0 <= doc_idx < len(docs):
+                    doc = docs[doc_idx]; file_id, name, type_ = doc.get('file_id'), doc.get('file_name', 'Док'), doc.get('type', '')
+                    if file_id: await context.bot.send_document(query.from_user.id, file_id, filename=name, caption=f"{type_}" if type_ else name )
+                    else: logger.warning(f"Нет file_id: {doc_idx}, {shipment_id}"); await _extracted_from_get_document_handler_25(query, "❌ Нет инфо о файле.")
+                else: logger.warning(f"Неверный idx {doc_idx} для {shipment_id}"); await _extracted_from_get_document_handler_25(query, "❌ Неверный документ.")
+            else: logger.warning(f"Груз {shipment_id} не найден."); await _extracted_from_get_document_handler_25(query, "❌ Инфо о грузе не найдена.")
+    except Exception as e:
+        logger.error(f"Ошибка get_document_handler '{query.data}': {e}", exc_info=True)
+        if query.message: await query.message.reply_text("❌ Не удалось отправить документ.")
+ # Вспомогательная, чтобы не дублировать код
+async def _extracted_from_get_document_handler_25(query: Any, arg1: str): # Добавлены типы для query и arg1
+    if query.message: await query.message.reply_text(arg1)
+
+async def handle_delete_shipment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.from_user or not query.data: return
+
+    user_id = query.from_user.id
+    if not is_admin(user_id):
+        await query.answer("❌ Доступ запрещен.", show_alert=True)
+        return
+
+    await query.answer("Удаляем сообщение у всех получателей...")
+
+    try:
+        if context.bot_data is None: context.bot_data = {}
+        
+        parts = query.data.split('_', 1)
+        if len(parts) < 2:
+            logger.error(f"Неверный callback для удаления: {query.data}")
+            if query.message: await query.message.reply_text("Ошибка: неверные данные для удаления.")
+            return
+        
+        shipment_id = parts[1]
+        shipments = context.bot_data.setdefault('shipments', {})
+        
+        if shipment_id in shipments:
+            s_data = shipments[shipment_id]
+            user_info = get_user_info(user_id)
+            admin_name = f"{user_info.get('first_name','')} {user_info.get('last_name',' ')}".strip() if user_info else f"ID {user_id}"
+            
+            deleted_caption = (f"🗑️ *Груз удален*\n"
+                               f"━━━━━━━━━━━━━━━━━━━━━\n"
+                               f"Данный груз (ID: `...{shipment_id[-6:]}`) был удален администратором ({admin_name}).\n"
+                               f"Дата удаления: {datetime.now().strftime('%d.%m.%Y %H:%M')}")
+
+            sent_messages = s_data.get('sent_messages', {})
+            comm_notif_messages = s_data.get('commission_notification_messages', {})
+            
+            # Обрабатываем все сообщения с фото и уведомления
+            for chat_id_del, msg_data in sent_messages.items():
+                try:
+                    chat_id_int = int(chat_id_del)
+                    # Получаем список ID всех фото или используем старое поле для обратной совместимости
+                    photo_msg_ids = msg_data.get('photo_msg_ids', [])
+                    if not photo_msg_ids and msg_data.get('photo_msg_id'):
+                        photo_msg_ids = [msg_data.get('photo_msg_id')]
+                    
+                    # Редактируем первое фото с описанием удаления
+                    if photo_msg_ids:
+                        await context.bot.edit_message_caption(
+                            chat_id=chat_id_int, 
+                            message_id=int(photo_msg_ids[0]), 
+                            caption=deleted_caption, 
+                            reply_markup=None, 
+                            parse_mode=ParseMode.MARKDOWN
+                        )
+                        # Удаляем остальные фото
+                        for photo_msg_id in photo_msg_ids[1:]:
+                            try:
+                                await context.bot.delete_message(chat_id=chat_id_int, message_id=int(photo_msg_id))
+                            except Exception as e:
+                                logger.warning(f"Не удалось удалить фото {photo_msg_id} в чате {chat_id_int}: {e}")
+                    
+                    # Удаляем сообщение с кнопками действий, если есть
+                    if msg_data.get('action_msg_id'):
+                        try:
+                            await context.bot.delete_message(chat_id=chat_id_int, message_id=int(msg_data.get('action_msg_id')))
+                        except Exception as e:
+                            logger.warning(f"Не удалось удалить сообщение с кнопками {msg_data.get('action_msg_id')} в чате {chat_id_int}: {e}")
+                except Exception as e: 
+                    logger.warning(f"Не удалось обработать сообщения для {chat_id_del}: {e}")
+            
+            # Удаляем уведомления комиссии
+            for chat_id_del, msg_id_del in comm_notif_messages.items():
+                try:
+                    await context.bot.delete_message(chat_id=int(chat_id_del), message_id=int(msg_id_del))
+                except Exception as e:
+                    logger.warning(f"Не удалось удалить уведомление {msg_id_del} в чате {chat_id_del}: {e}")
+            
+            del shipments[shipment_id]
+            logger.info(f"Супер-админ {user_id} удалил груз {shipment_id} и все связанные сообщения.")
+            deleted_msg = await context.bot.send_message(user_id, f"✅ Груз ID ...{shipment_id[-6:]} был помечен как удаленный для всех пользователей.")
+            # Автоматически удаляем сообщение через 15 секунд
+            await delete_message_after_delay(context, user_id, deleted_msg.message_id, 15)
+    except Exception as e:
+        logger.error(f"Ошибка в handle_delete_shipment для '{query.data}': {e}", exc_info=True)
+        await context.bot.send_message(user_id, "❌ Произошла ошибка при удалении сообщения.")
+
+def _format_commission_signatures_text(signatures: Dict[Any, Dict[str, Any]]) -> str:
+    if not signatures: return ""
+    lines = ["\n*Подписи комиссии:*"]
+    for user_id, sig_data in signatures.items():
+        if not isinstance(sig_data, dict) or sig_data.get('status') == 'pending': continue
+        user_info = get_user_info(int(user_id))
+        user_name = f"ID {user_id}"
+        if user_info: user_name = f"{user_info.get('first_name','')} {user_info.get('last_name',' ')}".strip() or user_info.get('username') or f"ID {user_id}"
+        
+        status = sig_data.get('status')
+        if status == 'signed':
+            timestamp_iso = sig_data.get('timestamp'); time_str = ""
+            if timestamp_iso:
+                try: time_str = f" в {datetime.fromisoformat(timestamp_iso).strftime('%H:%M:%S')}"
+                except (ValueError, TypeError): pass
+            lines.append(f"  ✅ {user_name} (Подписано{time_str})")
+        elif status == 'rejected':
+            reason = sig_data.get('rejection_reason', 'причина не указана')
+            lines.append(f"  ❌ {user_name} (Отклонено: {reason[:40]}...)")
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+async def handle_cargo_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # (Код этой функции был в предыдущем ответе, ЧАСТЬ 4, и он должен быть здесь полностью)
+    # ... (Вставьте сюда полный код функции handle_cargo_action из ответа Части 4)
+    query = update.callback_query
+    if not query or not query.from_user or not query.data: logger.warning("handle_cargo_action: нет query/user/data"); return
+    await query.answer()
+    user_clicked = query.from_user; user_info = get_user_info(user_clicked.id)
+    user_name = f"{user_info.get('first_name','')} {user_info.get('last_name',' ')}".strip() or user_info.get('username') or f"ID {user_clicked.id}" if user_info else f"ID {user_clicked.id}"
+    user_pos = user_info.get('position', 'Н/Д') if user_info else 'Н/Д'
+    try:
+        if context.bot_data is None: context.bot_data = {}; logger.warning("bot_data был None")
+        parts = query.data.split('_', 2)
+        if len(parts) < 3: logger.error(f"Плохой callback: {query.data}"); return
+        _, shipment_id, action_key_raw = parts; action_key = action_key_raw.strip()
+        shipments: Dict[str, Dict[str, Any]] = context.bot_data.setdefault('shipments', {})
+        if shipment_id not in shipments:
+            logger.warning(f"Груз {shipment_id} не найден ({action_key}).")
+            if query.message: await query.edit_message_reply_markup(reply_markup=None); await query.message.reply_text("Инфо о грузе устарела.")
+            return
+        s_data = shipments[shipment_id]; orig_caption = str(s_data.get('caption_text', "Инфо.")); current_s = str(s_data.get('status', 'Н/У')).lower()
+        doc_btns = _get_document_buttons_for_shipment(shipment_id, s_data.get('documents', [])); caption_update = ""; final_action = False
+        
+        r_key_comm = s_data.get('reception_type_key'); comm_ids: set[int] = set()
+        if isinstance(r_key_comm, str): comm_ids = ALL_COMMISSIONS_BY_KEY.get(r_key_comm, set())
+        r_name_disp = s_data.get('reception_type', 'Н/У')
+
+        if action_key in ["accepted", "lab_approved"] and comm_ids and s_data.get('commission_signing_status') not in ['all_signed', 'rejected', 'pending']:
+            can_init_c = (action_key == "accepted" and current_s in ['ожидает решения', 'неизвестен', None]) or \
+                         (action_key == "lab_approved" and current_s == 'ожидает протокол')
+            if not can_init_c: await query.answer(f"Неактуально. Статус: {current_s}", True); return
+            s_data.update({'status': 'ожидает подписания комиссией', 'commission_signing_status': 'pending', 'required_commission_members': list(comm_ids),
+                           'commission_signatures': {uid: {'status': 'pending'} for uid in comm_ids}, 'commission_process_initiator_name': user_name,
+                           'commission_process_initiator_id': user_clicked.id, 'commission_process_initiation_time': datetime.now().isoformat()}) # Сохраняем время инициации
+            caption_update = (f"\n\n*{'─'*20}*\n✍️ *Статус: Ожидает подписания Акта комиссией ({r_name_disp})*\n"
+                               f"Инициировано: {user_name} ({user_pos})\nКогда: {datetime.now().strftime('%d.%m.%Y %H:%M')}")
+            
+            # --- ИСПРАВЛЕНИЕ: Отправляем уведомление только членам комиссии ---
+            for m_id in comm_ids: 
+                m_info = get_user_info(m_id)
+                if m_info:
+                    m_name = f"{m_info.get('first_name','')} {m_info.get('last_name',' ')}".strip() or f"ID {m_id}"
+                    txt_to_m = (f"Ув. {m_name},\nПросим рассмотреть Акт для груза ID ...{shipment_id[-6:]} ({r_name_disp}).\n\nДетали:\n{orig_caption}\n" # Убрал лишний \n
+                                f"Отпр: {s_data.get('sender_name', 'Н/Д')}, Цех: {s_data.get('workshop', 'Н/Д')}")
+                    sign_btns_m = [[InlineKeyboardButton("✅ Подписать",callback_data=f"commact_{shipment_id}_sign"), InlineKeyboardButton("❌ Отказаться",callback_data=f"commact_{shipment_id}_rejectreason")]]
+                    try: 
+                        await context.bot.send_message(m_id, txt_to_m, reply_markup=InlineKeyboardMarkup(sign_btns_m), parse_mode=ParseMode.MARKDOWN)
+                    except Exception as e: logger.error(f"Не удалось уведомить {m_id}: {e}")
+                else: logger.warning(f"Член комиссии {m_id} (тип: {r_name_disp}) не зарегистрирован.")
+        elif action_key == "lab_check":
+            if current_s not in ['ожидает решения', 'неизвестен', None]: await query.answer(f"Решение принято: {current_s}", True); return
+            s_data['status'] = 'ожидает протокол'
+            s_data['lab_check_time_obj'] = datetime.now().isoformat() # Сохраняем время отправки в лабораторию
+            caption_update = (f"\n\n*{'─'*20}*\n🔬 *В лабораторию.*\nОжидается протокол.\n"
+                               f"Иниц: {user_name} ({user_pos})\nКогда: {datetime.now().strftime('%d.%m.%Y %H:%M')}")
+        else:
+            act_map = {"accepted":"Принято", "rejected":"Отказано", "lab_approved":"Принято (лаб.)", "lab_rejected":"Отказано (лаб.)"}
+            act_readable = act_map.get(action_key)
+            if not act_readable: logger.warning(f"Неизв. action: {action_key} для {shipment_id}"); return
+            can_proc = False
+            if action_key=="accepted" and not comm_ids and current_s in ['ожидает решения','неизвестен',None]: can_proc=True
+            elif action_key=="lab_approved" and not comm_ids and current_s=='ожидает протокол': can_proc=True
+            elif action_key in ["rejected","lab_rejected"] and current_s not in ["принято","отказано","принято (лаб.)","отказано (лаб.)","принято комиссией","отказано комиссией"]:
+                if (action_key=="rejected" and current_s in ['ожидает решения','неизвестен',None,'ожидает протокол','ожидает подписания комиссией']) or \
+                   (action_key=="lab_rejected" and current_s=='ожидает протокол'): can_proc=True
+            if not can_proc: await query.answer(f"Неактуально. Статус: {current_s}", True); return
+            s_data.update({'status':act_readable, 'decision_time_obj':datetime.now().isoformat(), 'decision_maker_name':user_name, 'decision_maker_id':user_clicked.id})
+            final_action = True
+            proc_sec = _calculate_processing_time_seconds(s_data)
+            time_el_str = format_timedelta_for_report(proc_sec) if proc_sec is not None else "Н/Д"
+            s_data['processing_time_str'] = time_el_str
+            caption_update = (f"\n\n*{'─'*20}*\n🚚 *Статус: {act_readable}*\nКем: {user_name} ({user_pos})\n"
+                               f"Когда: {datetime.now().strftime('%d.%m.%Y %H:%M')}\n⏱️ *Время:* {time_el_str}")
+            if s_data.get('commission_signing_status') in ['all_signed', 'rejected']: caption_update += _format_commission_signatures_text(s_data.get('commission_signatures', {}))
+            s_id_notify = s_data.get('sender_user_id')
+            if s_id_notify and isinstance(s_id_notify, int) and s_id_notify != user_clicked.id:
+                try: 
+                    update_msg = await context.bot.send_message(s_id_notify, f"🔔 Обновление по грузу ID ...{shipment_id[-6:]}:\n{caption_update.strip()}", parse_mode=ParseMode.MARKDOWN)
+                    # Автоматически удаляем сообщение через 15 секунд
+                    await delete_message_after_delay(context, s_id_notify, update_msg.message_id, 15)
+                except Exception as e: logger.error(f"Не удалось уведомить {s_id_notify}: {e}")
+        
+        comm_sign_status = s_data.get('commission_signing_status')
+        if final_action or comm_sign_status in ['all_signed', 'rejected', 'not_applicable']: # Добавлено 'not_applicable' для очистки уведомлений, если комиссия не нужна
+            comm_notif_msgs = s_data.get('commission_notification_messages', {})
+            if isinstance(comm_notif_msgs, dict):
+                for uid_del, mid_del in comm_notif_msgs.items():
+                    try: await context.bot.delete_message(chat_id=int(uid_del), message_id=int(mid_del))
+                    except Exception as e: logger.warning(f"Не уд. удалить увед. {mid_del} для {shipment_id} у {uid_del}: {e}")
+                s_data['commission_notification_messages'] = {}
+        
+        for chat_id_str_upd, msg_id_upd in s_data.get('sent_messages', {}).items():
+            try:
+                is_super_admin_for_btns = is_admin(int(chat_id_str_upd)) # <-- ПЕРЕМЕЩЕНО ВВЕРХ
+                chat_id_int_upd = int(chat_id_str_upd)
+                final_caption_upd = orig_caption + caption_update
+                if len(final_caption_upd) > 1024: final_caption_upd = final_caption_upd[:1020] + "..."
+                
+                updated_kb_edit = list(doc_btns)                
+
+                # Добавляем кнопку "Удалить" всегда, если это суперадмин
+                if is_super_admin_for_btns:
+                    # Проверяем, есть ли уже кнопка удаления, чтобы не дублировать
+                    has_delete_button = any('delshipment_' in btn.callback_data for row in updated_kb_edit for btn in row)
+                    if not has_delete_button:
+                        updated_kb_edit.append([InlineKeyboardButton("🗑️ Удалить (для всех)", callback_data=f"delshipment_{shipment_id}")])
+                current_s_for_btns = str(s_data.get('status', '')).lower()
+                
+                if is_super_admin_for_btns:
+                    if current_s_for_btns == 'ожидает решения':
+                        updated_kb_edit.extend([[InlineKeyboardButton("✅ Принято", callback_data=f"cargoaction_{shipment_id}_accepted"),
+                                                 InlineKeyboardButton("❌ Отказано", callback_data=f"cargoaction_{shipment_id}_rejected")],
+                                                [InlineKeyboardButton("🔬 В лабораторию", callback_data=f"cargoaction_{shipment_id}_lab_check")]])
+                    elif current_s_for_btns == 'ожидает протокол':
+                         updated_kb_edit.extend([[InlineKeyboardButton("✅ Соответствует (лаб)", callback_data=f"cargoaction_{shipment_id}_lab_approved"),
+                                                   InlineKeyboardButton("❌ Не соотв. (лаб)", callback_data=f"cargoaction_{shipment_id}_lab_rejected"),]])
+                final_reply_markup_edit_val: Optional[InlineKeyboardMarkup] = InlineKeyboardMarkup(updated_kb_edit) if updated_kb_edit else None
+                if final_action or comm_sign_status in ['all_signed', 'rejected'] or current_s_for_btns == 'ожидает подписания комиссией':
+                    final_reply_markup_edit_val = InlineKeyboardMarkup(doc_btns) if doc_btns else None
+                
+                msg_ids = s_data.get('sent_messages', {}).get(chat_id_str_upd, {})
+                photo_msg_id = msg_ids.get('photo_msg_id')
+                action_msg_id = msg_ids.get('action_msg_id')
+
+                try:
+                    if photo_msg_id:
+                        await context.bot.edit_message_caption(chat_id=chat_id_int_upd, message_id=int(photo_msg_id), caption=final_caption_upd, parse_mode=ParseMode.MARKDOWN)
+                    if action_msg_id:
+                        await context.bot.edit_message_reply_markup(chat_id=chat_id_int_upd, message_id=int(action_msg_id), reply_markup=final_reply_markup_edit_val)
+                except Exception as e: logger.error(f"Ошибка обновления сообщения ({action_key}) для {chat_id_str_upd}: {e}")
+            except Exception as e: logger.error(f"Ошибка в цикле обновления сообщений для {chat_id_str_upd}: {e}")
+    except ValueError as ve: logger.error(f"Ошибка разбора callback '{query.data}': {ve}", exc_info=True)
+    except Exception as e: logger.error(f"Крит. ошибка в handle_cargo_action для '{query.data}': {e}", exc_info=True)
+
+# --- ФУНКЦИИ ОТОБРАЖЕНИЯ (АДМИН) ---
+# (view_questions УДАЛЕНА)
+async def view_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # (Код функции view_users, как в предыдущем полном файле, доступ только для Супер Админа)
+    # ... (вставьте код view_users)
+    if not update.effective_user or not update.message: return
+    if not is_admin(update.effective_user.id): # Только Супер Админ
+        await update.message.reply_text("Эта команда доступна только главным администраторам.")
+        return
+    all_users_for_view = load_users()
+    if not all_users_for_view: await update.message.reply_text("❌ *Нет зарегистрированных пользователей.*", parse_mode=ParseMode.MARKDOWN); return
+    full_text = "👥 *Список участников:*\n"; current_dept = None
+    for user_rec_vu in sorted(all_users_for_view, key=lambda u: (str(u.get('department', '~')).lower(), str(u.get('first_name', '')).lower())):
+        dept_display_vu = user_rec_vu.get('department', 'Без отдела')
+        if dept_display_vu != current_dept:
+            if current_dept is not None: full_text += "\n" 
+            full_text += f"🏢 *{dept_display_vu}:*\n"; current_dept = dept_display_vu
+        name_vu = f"{user_rec_vu.get('first_name','')} {user_rec_vu.get('last_name',' ')}".strip() or user_rec_vu.get('username') or f"ID: {user_rec_vu.get('user_id')}"
+        pos_vu = user_rec_vu.get('position', 'Без должности')
+        full_text += f"   • {name_vu}"
+        if pos_vu and pos_vu != 'Без должности': full_text += f" _{pos_vu}_"
+        full_text += f"  `(ID: {user_rec_vu.get('user_id')})`\n"
+    full_text += f"\n*Всего:* {len(all_users_for_view)}"
+    for i in range(0, len(full_text), 4000): await update.message.reply_text(full_text[i:i+4000], parse_mode=ParseMode.MARKDOWN)
+
+
+async def view_commission_members_from_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # (Код функции view_commission_members_from_config, как в предыдущем полном файле, доступ только для Супер Админа)
+    # ... (вставьте код view_commission_members_from_config)
+    if not update.effective_user or not update.message: return
+    if not is_admin(update.effective_user.id): # Только Супер Админ
+        await update.message.reply_text("Эта команда доступна только главным администраторам."); return
+    full_text = "👥 *Составы Приемных Комиссий:*\n"; any_filled = False
+
+    if context.bot_data is None: context.bot_data = {}
+    shipments_data = context.bot_data.get('shipments', {})
+    signature_counts: Dict[int, int] = {} 
+
+    for shipment in shipments_data.values():
+        signatures = shipment.get('commission_signatures', {})
+        if isinstance(signatures, dict):
+            for user_id, sig_data in signatures.items():
+                if isinstance(sig_data, dict) and sig_data.get('status') == 'signed':
+                    signature_counts[user_id] = signature_counts.get(user_id, 0) + 1
+
+    for comm_key, member_ids in ALL_COMMISSIONS_BY_KEY.items():
+        comm_name = RECEPTION_TYPES_KEYBOARD_MAPPING.get(comm_key, comm_key.capitalize())
+        full_text += f"\n🛡️ *Комиссия: {comm_name}* (Ключ: `{comm_key}`)"
+        if not member_ids: full_text += " (ID не определены)\n"; continue
+        any_filled = True; found_count = 0
+        for uid in member_ids:
+            user_info = get_user_info(uid)
+            sign_count = signature_counts.get(uid, 0)
+            if user_info:
+                name = f"{user_info.get('first_name','')} {user_info.get('last_name',' ')}".strip() or user_info.get('username') or f"ID: {uid}"
+                details: List[str] = []; dept = user_info.get('department'); pos = user_info.get('position')
+                if dept and dept not in ['Не указан','Не указана']: details.append(str(dept))
+                if pos and pos not in ['Не указан','Не указана']: details.append(str(pos))
+                details_s = ', '.join(details) if details else 'Н/Д'
+                full_text += f"   • {name} ({details_s}) `ID: {uid}`\n     *Подписано актов: {sign_count}*\n"; found_count += 1
+            else:
+                full_text += f"   • ID: {uid} (Не зарегистрирован)\n"
+                if sign_count > 0: full_text += f"     *Подписано актов: {sign_count}*\n"
+        if found_count == 0 and member_ids: full_text += "   (Участники не найдены)\n"
+    if not any_filled: full_text = "👥 ID для комиссий не определены."
+    for i in range(0, len(full_text), 4000): await update.message.reply_text(full_text[i:i+4000], parse_mode=ParseMode.MARKDOWN)
+
+# (format_timedelta_for_report, _calculate_processing_time_seconds, generate_cargo_report - как были, generate_cargo_report только для Супер Админа)
+# ... (вставьте код этих трех функций)
+def format_timedelta_for_report(td_seconds: Optional[float]) -> str:
+    if td_seconds is None or td_seconds < 0: return "Н/Д" 
+    td = timedelta(seconds=td_seconds); days = td.days; hours, rem = divmod(td.seconds, 3600); mins, secs = divmod(rem, 60)
+    parts = []; 
+    if days > 0: parts.append(f"{days} дн.")
+    if days > 0 or hours > 0 or mins > 0 or secs > 0:
+        if not (days > 0 and hours == 0 and mins == 0 and secs == 0): parts.append(f"{hours:02d}:{mins:02d}:{secs:02d}")
+    return " ".join(parts) if parts else "менее 1 сек."
+
+def _calculate_processing_time_seconds(s_data: Dict[str, Any]) -> Optional[float]:
+    p_dt_str = s_data.get('photo_datetime_obj'); d_dt_str = s_data.get('decision_time_obj'); s_id = s_data.get('shipment_id', 'N/A')
+    if p_dt_str and d_dt_str and isinstance(p_dt_str, str) and isinstance(d_dt_str, str):
+        try:
+            p_dt = datetime.fromisoformat(p_dt_str); d_dt = datetime.fromisoformat(d_dt_str)
+            if d_dt >= p_dt: return (d_dt - p_dt).total_seconds()
+            else: logger.warning(f"Время решения {d_dt} раньше фото {p_dt} для {s_id}")
+        except ValueError as e: logger.warning(f"Неверный формат даты для {s_id}: {e}")
+    return None
+
+async def generate_cargo_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message: return
+    if not is_admin(update.effective_user.id): # Только Супер Админ
+        await update.message.reply_text("Эта команда доступна только главным администраторам."); return
+    if context.bot_data is None: context.bot_data = {}
+    s_data_all: Dict[str, Dict[str, Any]] = context.bot_data.get('shipments', {})
+    if not s_data_all: await update.message.reply_text("📊 *Отчет*\nЗаписей нет.", parse_mode=ParseMode.MARKDOWN); return
+    total_s = len(s_data_all)
+    s_counts = {'ожидает решения':0,'ожидает протокол':0,'ожидает подписания комиссией':0,'принято (прямое/лаб.)':0,'отказано (прямое/лаб.)':0,'принято комиссией':0,'отказано комиссией':0,'неизвестен':0}
+    for s_id, s_rec in s_data_all.items():
+        status, comm_s_status = str(s_rec.get('status','неизвестен')).lower(), s_rec.get('commission_signing_status')
+        final_s = status; 
+        if comm_s_status == 'all_signed': final_s = 'принято комиссией'
+        elif comm_s_status == 'rejected': final_s = 'отказано комиссией'
+        if final_s.startswith('принято'): s_counts['принято комиссией' if 'комиссией' in final_s else 'принято (прямое/лаб.)'] += 1
+        elif final_s.startswith('отказано'): s_counts['отказано комиссией' if 'комиссией' in final_s else 'отказано (прямое/лаб.)'] += 1
+        elif final_s in s_counts: s_counts[final_s] += 1
+        else: s_counts['неизвестен'] +=1
+    report_txt_parts = [f"📊 *Отчет по грузам*\nВсего: {total_s}", "─"*20, "*Сводка:*"]
+    for s_name, count in s_counts.items():
+        if count > 0 : report_txt_parts.append(f" • {s_name.capitalize()}: {count}")
+    report_txt_parts.append("─"*20)
+    sorted_s_detail: List[Dict[str, Any]] = sorted(s_data_all.values(), key=lambda s: datetime.fromisoformat(s['photo_datetime_obj']) if s.get('photo_datetime_obj') and isinstance(s['photo_datetime_obj'], str) else datetime.min, reverse=True)
+    if sorted_s_detail: report_txt_parts.append("*Последние грузы:*")
+    for s_det in sorted_s_detail[:5]:
+        s_id_d = str(s_det.get('shipment_id','N/A')); sender_d = s_det.get('sender_name','Н/Д'); ws_d = s_det.get('workshop','Н/Д')
+        rt_d = s_det.get('reception_type','Н/Д'); pt_s_d = s_det.get('photo_time_str','Н/Д'); comm_s_s_d = s_det.get('commission_signing_status')
+        dm_d = s_det.get('decision_maker_name',''); ci_d = s_det.get('commission_process_initiator_name','')
+        status_l_d = f"Статус: *{s_det.get('status','Н/Д')}*"
+        if comm_s_s_d == 'pending':
+            sigs_m = s_det.get('commission_signatures',{}); signed_c = sum(1 for sd in sigs_m.values() if isinstance(sd,dict) and sd.get('status')=='signed')
+            req_m = s_det.get('required_commission_members',[]); total_m = len(req_m) if isinstance(req_m,list) else 0
+            status_l_d += f" (Ком: {signed_c}/{total_m} подп.)"
+        elif comm_s_s_d == 'rejected':
+            sigs_m_r = s_det.get('commission_signatures',{}); rej_r = "Н/У"
+            if isinstance(sigs_m_r, dict):
+                for _, sd_r in sigs_m_r.items():
+                    if isinstance(sd_r,dict) and sd_r.get('status')=='rejected': rej_r = str(sd_r.get('rejection_reason','Н/У')); break
+            status_l_d += f" (Откл. ком. Причина: {rej_r[:50]}...)"
+        proc_t_s_d = s_det.get('processing_time_str', "Н/Д")
+        if proc_t_s_d == "Н/Д" or proc_t_s_d is None:
+            time_s_d = _calculate_processing_time_seconds(s_det)
+            if time_s_d is not None: proc_t_s_d = format_timedelta_for_report(time_s_d)
+        details_entry_txt = (f"🆔 `{s_id_d[-6:]}` ({rt_d})\nОт: {sender_d} для: {ws_d}\n📸 {pt_s_d}\n{status_l_d}\n")
+        if dm_d and not ci_d : details_entry_txt += f"👤 Решение: {dm_d}\n"
+        if ci_d: details_entry_txt += f"👥 Комиссия: {ci_d}\n"
+        details_entry_txt += f"⏱️ Время: {proc_t_s_d}\n"; report_txt_parts.append(details_entry_txt)
+    if len(sorted_s_detail) > 5: report_txt_parts.append(f"\n_(Показаны 5 из {len(sorted_s_detail)} грузов.)_")
+    full_report = "\n".join(report_txt_parts)
+    for i in range(0,len(full_report),4000): await update.message.reply_text(full_report[i:i+4000], parse_mode=ParseMode.MARKDOWN)
+    
+    # Добавляем кнопку для скачивания полного отчета
+    download_button = [[InlineKeyboardButton("📥 Скачать полный отчет (CSV)", callback_data="download_full_report")]]
+    await update.message.reply_text("Вы можете скачать полный отчет в формате CSV.", reply_markup=InlineKeyboardMarkup(download_button))
+
+def _generate_csv_report_bytes(shipments_data: Dict[str, Dict[str, Any]]) -> io.BytesIO:
+    output = io.StringIO()
+    writer = csv.writer(output, delimiter=';')
+
+    headers = [
+        "ID груза", "Дата/Время фото", "Отправитель", "Цех/Проект", "Место приемки", "Тип приемки", 
+        "Статус", "Дата/Время решения", "Кто принял решение", "Время обработки (ч:м:с)", 
+        "Кол-во документов", "Подписи комиссии", "Время на решение лаборатории (ч:м:с)"
+    ]
+    writer.writerow(headers)
+
+    def _format_signatures_for_csv(signatures: Dict[Any, Dict[str, Any]]) -> str:
+        if not signatures: return "Н/П"
+        parts = []
+        for user_id, sig_data in signatures.items():
+            if not isinstance(sig_data, dict): continue
+            user_info = get_user_info(int(user_id))
+            user_name = f"ID {user_id}"
+            if user_info: user_name = f"{user_info.get('first_name','')} {user_info.get('last_name',' ')}".strip() or user_info.get('username') or f"ID {user_id}"
+            
+            status = sig_data.get('status')
+            if status == 'signed':
+                timestamp_iso = sig_data.get('timestamp'); time_str = ""
+                if timestamp_iso:
+                    try: time_str = f" в {datetime.fromisoformat(timestamp_iso).strftime('%H:%M:%S')}"
+                    except (ValueError, TypeError): pass
+                parts.append(f"{user_name} (Подписано{time_str})")
+            elif status == 'rejected':
+                reason = sig_data.get('rejection_reason', 'причина не указана')
+                parts.append(f"{user_name} (Отклонено: {reason})")
+            elif status == 'pending':
+                 parts.append(f"{user_name} (Ожидает)")
+        return "; ".join(parts) if parts else "Н/П"
+
+    def _calculate_lab_time_str(s_data: Dict[str, Any]) -> str:
+        lab_start_str = s_data.get('lab_check_time_obj')
+        decision_str = s_data.get('decision_time_obj')
+        if not lab_start_str or not decision_str or s_data.get('status') not in ['Принято (лаб.)', 'Отказано (лаб.)']: return "Н/П"
+        try: return format_timedelta_for_report((datetime.fromisoformat(decision_str) - datetime.fromisoformat(lab_start_str)).total_seconds())
+        except (ValueError, TypeError): return "Ошибка расчета"
+
+    sorted_shipments = sorted(
+        shipments_data.values(),
+        key=lambda s: datetime.fromisoformat(s['photo_datetime_obj']) if s.get('photo_datetime_obj') and isinstance(s['photo_datetime_obj'], str) else datetime.min,
+        reverse=True
+    )
+
+    for s_det in sorted_shipments:
+        final_status = s_det.get('status', 'Н/Д')
+        if s_det.get('commission_signing_status') == 'all_signed': final_status = 'Принято комиссией'
+        elif s_det.get('commission_signing_status') == 'rejected': final_status = 'Отказано комиссией'
+        row = [
+            s_det.get('shipment_id', 'N/A'),
+            s_det.get('photo_time_str', 'Н/Д'),
+            s_det.get('sender_name', 'Н/Д'),
+            s_det.get('workshop', 'Н/Д'),
+            s_det.get('receiving_place', 'Н/Д'),
+            s_det.get('reception_type', 'Н/Д'),
+            final_status,
+            datetime.fromisoformat(s_det['decision_time_obj']).strftime('%d.%m.%Y %H:%M') if s_det.get('decision_time_obj') else 'Н/Д',
+            s_det.get('decision_maker_name', 'Н/Д'),
+            s_det.get('processing_time_str', 'Н/Д'),
+            len(s_det.get('documents', [])),
+            _format_signatures_for_csv(s_det.get('commission_signatures', {})),
+            _calculate_lab_time_str(s_det)
+        ]
+        writer.writerow(row)
+    
+    return io.BytesIO(output.getvalue().encode('utf-8-sig')) # utf-8-sig для корректного отображения в Excel
+
+# (show_detailed_cargo_table_callback, handle_commission_sign_act, _generate_non_conformance_act_text, 
+#  commission_ask_rejection_reason, commission_handle_rejection_reason, cancel_rejection_reason, 
+#  cancel, error_handler - код этих функций как в предыдущем полном ответе, с переименованием переменных)
+# ... (вставьте сюда код этих функций)
+
+async def show_detailed_cargo_table_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query; 
+    if not query or not query.message: return
+    await query.answer(); await query.message.reply_text("Эта функция более не используется.", parse_mode=ParseMode.MARKDOWN)
+    try: await query.edit_message_reply_markup(reply_markup=None)
+    except Exception as e: logger.info(f"Не удалось убрать кнопку (таблица): {e}")
+
+async def download_full_report_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.from_user: return
+    
+    if not is_admin(query.from_user.id):
+        await query.answer("❌ Доступ запрещен.", show_alert=True)
+        return
+
+    await query.answer("⏳ Формируем отчет...")
+    if context.bot_data is None: context.bot_data = {}
+    shipments_data = context.bot_data.get('shipments', {})
+    if not shipments_data:
+        await query.message.reply_text("Нет данных для формирования отчета.")
+        return
+    csv_file = _generate_csv_report_bytes(shipments_data)
+    await context.bot.send_document(chat_id=query.from_user.id, document=csv_file, filename=f"cargo_report_{datetime.now().strftime('%Y-%m-%d')}.csv")
+
+async def handle_commission_sign_act(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # (Код функции как в предыдущем полном файле, с учетом всех переименований)
+    query = update.callback_query;
+    if not query or not query.from_user or not query.data or not query.message: return
+    await query.answer(); user_signer = query.from_user
+    try:
+        if context.bot_data is None: context.bot_data = {}
+        parts = query.data.split('_', 2);
+        if len(parts) < 3: await query.edit_message_text("Ошибка данных.",reply_markup=None); return
+        _, shipment_id, action = parts
+        shipments: Dict[str,Dict[str,Any]] = context.bot_data.setdefault('shipments',{})
+        if shipment_id not in shipments: await query.edit_message_text("Инфо устарела.",reply_markup=None); return
+        s_data = shipments[shipment_id]
+        if s_data.get('commission_signing_status') != 'pending': await query.edit_message_text(f"Подписание завершено ({s_data.get('commission_signing_status')}).",reply_markup=None); return
+        req_members: list = s_data.get('required_commission_members',[]) # type: ignore
+        if not isinstance(req_members, list) or user_signer.id not in req_members: await query.edit_message_text("Вы не член комиссии.",reply_markup=None); return
+        signatures_comm: Dict[Any,Dict[str,Any]] = s_data.setdefault('commission_signatures',{})
+        user_sig = signatures_comm.get(user_signer.id,{})
+        if user_sig.get('status')=='signed': await query.edit_message_text("Вы уже подписали этот акт.",reply_markup=None); return
+        if user_sig.get('status')=='rejected': await query.edit_message_text("Ранее отказано.",reply_markup=None); return
+        signatures_comm[user_signer.id] = {'status':'signed','timestamp':datetime.now().isoformat(),'rejection_reason':None}
+        await query.edit_message_text("✅ Голос 'Подписано' учтен. Ожидаем остальных.",reply_markup=None)
+        all_signed_flag = True; req_members_chk: list = s_data.get('required_commission_members',[]) # type: ignore
+        if not isinstance(req_members_chk,list): req_members_chk = []
+        for m_id_chk in req_members_chk:
+            if signatures_comm.get(m_id_chk,{}).get('status')!='signed': all_signed_flag=False; break
+        num_s = sum(1 for sd in signatures_comm.values() if isinstance(sd,dict) and sd.get('status')=='signed'); total_m = len(req_members_chk)
+        orig_cap = str(s_data.get('caption_text',"Инфо.")); doc_btns_f = _get_document_buttons_for_shipment(shipment_id,s_data.get('documents',[]))
+        final_markup: Optional[InlineKeyboardMarkup] = InlineKeyboardMarkup(doc_btns_f) if doc_btns_f else None; updated_cap = orig_cap
+        
+        if all_signed_flag and total_m > 0:
+            s_data['commission_signing_status'] = 'all_signed'; final_stat = f"Принято комиссией ({s_data.get('reception_type','')})"
+            s_data['status'] = final_stat; s_data['decision_time_obj'] = datetime.now().isoformat()
+            proc_s = _calculate_processing_time_seconds(s_data); s_data['processing_time_str'] = format_timedelta_for_report(proc_s) if proc_s is not None else "Н/Д"
+            updated_cap += (f"\n\n*{'─'*20}*\n🎉 *Статус: АКТ ПОДПИСАН КОМИССИЕЙ!*\n" # Обновленный статус
+                            f"Принято: {datetime.now().strftime('%d.%m.%Y %H:%M')}\n⏱️ *Время:* {s_data.get('processing_time_str','Н/Д')}")
+            updated_cap += _format_commission_signatures_text(signatures_comm)
+            sender_id_final = s_data.get('sender_user_id')
+            if sender_id_final and isinstance(sender_id_final, int):
+                try: 
+                    accepted_msg = await context.bot.send_message(sender_id_final, f"🔔 Груз ID ...{shipment_id[-6:]} ПРИНЯТ КОМИССИЕЙ.", parse_mode=ParseMode.MARKDOWN)
+                    # Автоматически удаляем сообщение через 15 секунд
+                    await delete_message_after_delay(context, sender_id_final, accepted_msg.message_id, 15)
+                except Exception as e: logger.error(f"Не удалось уведомить {sender_id_final}: {e}")
+        else: # Если еще не все подписали или подписей нет
+            if total_m > 0: updated_cap += (f"\n\n*{'─'*20}*\n✍️ *Статус Акта: Подписано {num_s} из {total_m} ({s_data.get('reception_type','')}).*")
+            updated_cap += _format_commission_signatures_text(signatures_comm)
+        
+        if s_data.get('commission_signing_status') in ['all_signed','rejected']: # Удаление уведомлений комиссии
+            comm_notif_msgs_del = s_data.get('commission_notification_messages',{})
+            if isinstance(comm_notif_msgs_del, dict):
+                for uid_s, mid_v in comm_notif_msgs_del.items():
+                    try: await context.bot.delete_message(int(uid_s),int(mid_v))
+                    except Exception as e: logger.warning(f"Не уд. удалить увед. {mid_v} для {shipment_id} у {uid_s}: {e}")
+                s_data['commission_notification_messages'] = {}
+        
+        sent_msgs_s = s_data.get('sent_messages',{});
+        if isinstance(sent_msgs_s, dict):
+            for chat_id_s, msg_data_s in sent_msgs_s.items():
+                try:
+                    # Получаем ID первого фото из медиа-группы или обычного фото
+                    photo_msg_id = msg_data_s.get('photo_msg_id') if isinstance(msg_data_s, dict) else msg_data_s
+                    if not photo_msg_id:
+                        continue
+                    cap_send = updated_cap;
+                    if len(cap_send) > 1024: cap_send = cap_send[:1020]+"..."
+                    # Обновляем только caption фото, без reply_markup (кнопки уже в отдельном сообщении)
+                    await context.bot.edit_message_caption(int(chat_id_s), int(photo_msg_id), caption=cap_send, parse_mode=ParseMode.MARKDOWN)
+                    # Обновляем кнопки в отдельном сообщении, если оно есть
+                    action_msg_id_s = msg_data_s.get('action_msg_id') if isinstance(msg_data_s, dict) else None
+                    if action_msg_id_s:
+                        await context.bot.edit_message_reply_markup(chat_id=int(chat_id_s), message_id=int(action_msg_id_s), reply_markup=final_markup)
+                except Exception as e: logger.error(f"Ошибка обновления сообщения (комиссия) {photo_msg_id} в {chat_id_s}: {e}")
+    except Exception as e: logger.error(f"Ошибка в handle_commission_sign_act для '{query.data}': {e}", exc_info=True)
+
+def _generate_non_conformance_act_text(shipment_id: str, s_data: Dict[str, Any], r_name: str, r_pos: str, reason: str) -> str:
+    # (Код функции как в предыдущем полном файле)
+    act_t = datetime.now().strftime('%d.%m.%Y %H:%M'); s_id = shipment_id[-6:]
+    txt_parts = [f"⚠️ *АКТ НЕСООТВЕТСТВИЯ № ...{s_id}*", f"Дата: {act_t}", f"Место: {s_data.get('receiving_place','Н/Д')}",
+        "\n*1. Инфо о товаре:*", str(s_data.get('caption_text','Инфо.')),f"ID: {shipment_id}",f"Отпр: {s_data.get('sender_name','Н/Д')}",
+        f"Для: {s_data.get('workshop','Н/Д')}",f"Тип: {s_data.get('reception_type','Н/Д')}", "\n*2. Несоответствия:*",
+        f"Отказал: {r_name} ({r_pos})",f"Причина: {reason}",f"Дата: {act_t}", "\n*3. Причины (предпол.):*", "Основание - отказ члена комиссии.",
+        "\n*4. Рекомендации:*", "- Вернуть/Заменить.","(Выбрать/указать)", "\n*5. Заключение:*", "Не соотв. Приемка отклонена.",
+        "\n*Подписи (отказавший):*", f"- {r_name} ({r_pos}) - {act_t}"]
+    return "\n".join(txt_parts)
+
+async def commission_ask_rejection_reason(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
+    # (Код функции как в предыдущем полном файле, с инициализацией user_data и bot_data)
+    query = update.callback_query
+    if not query or not query.from_user or not query.data or not query.message: return ConversationHandler.END
+    await query.answer(); user_rejects = query.from_user
+    try:
+        if context.user_data is None: context.user_data = {}
+        if context.bot_data is None: context.bot_data = {}
+        parts = query.data.split('_',2);
+        if len(parts)<3: await query.edit_message_text("Ошибка данных.",reply_markup=None); return ConversationHandler.END
+        _, s_id, action = parts
+        shipments: Dict[str,Dict[str,Any]] = context.bot_data.setdefault('shipments',{})
+        if s_id not in shipments: await query.edit_message_text("Информация о грузе устарела или груз был удален.",reply_markup=None); return ConversationHandler.END
+        s_data = shipments[s_id]
+        if s_data.get('commission_signing_status')!='pending': await query.edit_message_text(f"Подписание завершено ({s_data.get('commission_signing_status')}).",reply_markup=None); return ConversationHandler.END
+        req_m_rej: list = s_data.get('required_commission_members',[]) # type: ignore
+        if not isinstance(req_m_rej,list) or user_rejects.id not in req_m_rej: await query.edit_message_text("Вы не член комиссии.",reply_markup=None); return ConversationHandler.END
+        signatures_comm_rej: Dict[Any,Dict[str,Any]] = s_data.setdefault('commission_signatures',{})
+        user_sig_rej = signatures_comm_rej.get(user_rejects.id,{})
+        if user_sig_rej.get('status')=='rejected': await query.edit_message_text("Уже отказано.",reply_markup=None); return ConversationHandler.END
+        if user_sig_rej.get('status')=='signed': await query.edit_message_text("Вы уже подписали этот акт. Отказаться невозможно.",reply_markup=None); return ConversationHandler.END
+        context.user_data['rejecting_shipment_id'] = s_id
+        await query.edit_message_text("📝 Укажите причину отказа (след. сообщением).\nОтмена: /cancel_reason.",reply_markup=None,parse_mode=ParseMode.MARKDOWN)
+        set_user_state(context, user_rejects.id, States.AWAITING_REJECTION_REASON); return States.AWAITING_REJECTION_REASON
+    except Exception as e: logger.error(f"Ошибка в commission_ask_rejection_reason: {e}", exc_info=True)
+    if query.message: await query.edit_message_text("Произошла ошибка.",reply_markup=None)
+    return ConversationHandler.END
+
+async def commission_handle_rejection_reason(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    # (Код функции как в предыдущем полном файле, с инициализацией user_data и bot_data)
+    if not update.effective_user or not update.message or not update.message.text: return ConversationHandler.END
+    user_rejected = update.effective_user; reason = update.message.text
+    if context.user_data is None: context.user_data = {}
+    s_id = context.user_data.get('rejecting_shipment_id') # Получаем ID груза из user_data
+    clear_user_state(context,user_rejected.id)
+    if not s_id or not isinstance(s_id,str): await update.message.reply_text("Не удалось определить груз."); return ConversationHandler.END
+    if context.bot_data is None: context.bot_data = {}
+    shipments: Dict[str,Dict[str,Any]] = context.bot_data.setdefault('shipments',{})
+    if s_id not in shipments: await update.message.reply_text("Инфо о грузе не найдена."); return ConversationHandler.END
+    s_data = shipments[s_id]
+    signatures_comm_hrr: Dict[Any,Dict[str,Any]] = s_data.setdefault('commission_signatures',{}) # type: ignore
+    signatures_comm_hrr[user_rejected.id] = {'status':'rejected','timestamp':datetime.now().isoformat(),'rejection_reason':reason}
+    s_data['commission_signing_status'] = 'rejected'; final_s_text = f"Отказано комиссией ({s_data.get('reception_type','')})"
+    s_data['status'] = final_s_text; s_data['decision_time_obj'] = datetime.now().isoformat()
+    proc_s_hrr = _calculate_processing_time_seconds(s_data); s_data['processing_time_str'] = format_timedelta_for_report(proc_s_hrr) if proc_s_hrr is not None else "Н/Д"
+    user_info_rej = get_user_info(user_rejected.id); rej_name = f"{user_info_rej.get('first_name','')} {user_info_rej.get('last_name',' ')}".strip() if user_info_rej else f"ID {user_rejected.id}"
+    rej_pos = user_info_rej.get('position','Н/Д') if user_info_rej else 'Н/Д'
+    await update.message.reply_text("📝 Причина отказа принята. Формируется Акт.",parse_mode=ParseMode.MARKDOWN)
+    non_conf_report = _generate_non_conformance_act_text(s_id,s_data,rej_name,rej_pos,reason)
+    logger.info(f"АКТ НЕСООТВЕТСТВИЯ {s_id}:\n{non_conf_report}")
+    for admin_uid in ADMIN_IDS:
+        try:
+            for i in range(0,len(non_conf_report),4000): await context.bot.send_message(admin_uid,non_conf_report[i:i+4000],parse_mode=ParseMode.MARKDOWN)
+        except Exception as e: logger.error(f"Не удалось отправить акт админу {admin_uid}: {e}")
+    orig_cap_hrr = str(s_data.get('caption_text',"Инфо.")); doc_btns_hrr = _get_document_buttons_for_shipment(s_id,s_data.get('documents',[]))
+    final_markup_hrr: Optional[InlineKeyboardMarkup] = InlineKeyboardMarkup(doc_btns_hrr) if doc_btns_hrr else None
+    updated_cap_hrr = orig_cap_hrr + (f"\n\n*{'─'*20}*\n🚫 *Статус: АКТ ОТКЛОНЕН КОМИССИЕЙ!*\nПричина: {reason}\nОтклонил: {rej_name} ({rej_pos})\n"
+                                   f"Когда: {datetime.now().strftime('%d.%m.%Y %H:%M')}\n⏱️ *Время:* {s_data.get('processing_time_str','Н/Д')}")
+    updated_cap_hrr += _format_commission_signatures_text(signatures_comm_hrr)
+    
+    if s_data.get('commission_signing_status') == 'rejected': # Удаление уведомлений комиссии
+        comm_notif_msgs_del_hrr = s_data.get('commission_notification_messages',{})
+        if isinstance(comm_notif_msgs_del_hrr, dict):
+            for uid_s_hrr, mid_v_hrr in comm_notif_msgs_del_hrr.items():
+                try: await context.bot.delete_message(int(uid_s_hrr),int(mid_v_hrr))
+                except Exception as e: logger.warning(f"Не уд. удалить увед. (reject_reason) {mid_v_hrr} у {uid_s_hrr}: {e}")
+            s_data['commission_notification_messages'] = {}
+
+    sent_msgs_hrr = s_data.get('sent_messages',{});
+    if isinstance(sent_msgs_hrr, dict):
+        for chat_id_s_hrr, msg_data_s_hrr in sent_msgs_hrr.items():
+            try:
+                # Получаем ID первого фото из медиа-группы или обычного фото
+                photo_msg_id_hrr = msg_data_s_hrr.get('photo_msg_id') if isinstance(msg_data_s_hrr, dict) else msg_data_s_hrr
+                if not photo_msg_id_hrr:
+                    continue
+                cap_send_hrr = updated_cap_hrr;
+                if len(cap_send_hrr)>1024: cap_send_hrr = cap_send_hrr[:1020]+"..."
+                # Обновляем только caption фото, без reply_markup (кнопки уже в отдельном сообщении)
+                await context.bot.edit_message_caption(int(chat_id_s_hrr), int(photo_msg_id_hrr), caption=cap_send_hrr, parse_mode=ParseMode.MARKDOWN)
+                # Обновляем кнопки в отдельном сообщении, если оно есть
+                action_msg_id_hrr = msg_data_s_hrr.get('action_msg_id') if isinstance(msg_data_s_hrr, dict) else None
+                if action_msg_id_hrr:
+                    await context.bot.edit_message_reply_markup(chat_id=int(chat_id_s_hrr), message_id=int(action_msg_id_hrr), reply_markup=final_markup_hrr)
+            except Exception as e: logger.error(f"Ошибка обновления (отказ ком.) {photo_msg_id_hrr} в {chat_id_s_hrr}: {e}")
+    sender_id_hrr = s_data.get('sender_user_id')
+    if sender_id_hrr and isinstance(sender_id_hrr, int):
+        try: 
+            rejected_msg = await context.bot.send_message(sender_id_hrr, f"🚫 Груз ID ...{s_id[-6:]} ОТКЛОНЕН КОМИССИЕЙ.\nПричина: {reason}", parse_mode=ParseMode.MARKDOWN)
+            # Автоматически удаляем сообщение через 15 секунд
+            await delete_message_after_delay(context, sender_id_hrr, rejected_msg.message_id, 15)
+        except Exception as e: logger.error(f"Не удалось уведомить отправителя {sender_id_hrr} об отказе: {e}")
+    return ConversationHandler.END
+
+async def cancel_rejection_reason(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.message or not update.effective_user: return ConversationHandler.END
+    await update.message.reply_text("Ввод причины отказа отменен.")
+    clear_user_state(context, update.effective_user.id) # Передаем user_id
+    return ConversationHandler.END
+
+# --- Отмена и обработчик ошибок (обновлен) ---
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.effective_user or not update.message: return ConversationHandler.END 
+    user_id_cancel = update.effective_user.id
+    
+    # Удаляем сообщения диалога перед отменой
+    await delete_dialogue_messages(context, user_id_cancel)
+
+    current_state_cancel = get_user_state(context, user_id_cancel) # Передаем user_id
+    await update.message.reply_text("❌ Операция отменена.", parse_mode=ParseMode.MARKDOWN)
+    is_reg_cancel = current_state_cancel in [States.AWAITING_NAME, States.AWAITING_SURNAME, States.AWAITING_DEPARTMENT, States.AWAITING_POSITION]
+    clear_user_state(context, user_id_cancel) # Передаем user_id
+    if current_state_cancel == States.AWAITING_REJECTION_REASON: pass 
+    elif is_reg_cancel: await update.message.reply_text("Регистрация прервана. Нажмите /start.", parse_mode=ParseMode.MARKDOWN)
+    else: await start(update, context) 
+    return ConversationHandler.END
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error(f"Ошибка: {context.error}", exc_info=context.error)
+    eff_msg = None; eff_uid = None
+    if isinstance(update, Update):
+        if update.effective_message: eff_msg = update.effective_message
+        if update.effective_user: eff_uid = update.effective_user.id
+    if eff_msg:
+        try: await eff_msg.reply_text("❌ *Непредвиденная ошибка.* Попробуйте /start.", parse_mode=ParseMode.MARKDOWN)
+        except Exception as e: logger.error(f"Не удалось отправить сообщение об ошибке: {e}")
+    if eff_uid: await delete_dialogue_messages(context, eff_uid); clear_user_state(context, eff_uid) # Удаляем сообщения и очищаем состояние
+
+# --- Инициализация ConversationHandler'ов ---
+
+async def clear_cargo_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Запрашивает подтверждение на очистку отчета по грузам. Доступно только для Супер Админа."""
+    if not update.effective_user or not update.message: return
+    user_id = update.effective_user.id
+    
+    if not is_admin(user_id):
+        await update.message.reply_text("❌ Эта команда доступна только главным администраторам.")
+        return
+
+    if context.bot_data is None: context.bot_data = {}
+    shipments = context.bot_data.get('shipments', {})
+    
+    if not shipments:
+        await update.message.reply_text("✅ Отчет по грузам уже пуст. Нечего очищать.")
+        return
+        
+    confirmation_keyboard = [[
+        InlineKeyboardButton("🗑️ Да, очистить отчет", callback_data="confirm_clear_report"),
+        InlineKeyboardButton("❌ Нет, отмена", callback_data="cancel_clear_report")
+    ]]
+    reply_markup = InlineKeyboardMarkup(confirmation_keyboard)
+    await update.message.reply_text(
+        f"⚠️ *ВНИМАНИЕ!* Вы уверены, что хотите полностью очистить отчет по грузам?\n\n"
+        f"Будет удалено *{len(shipments)}* записей о грузах. "
+        f"Это действие необратимо!",
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def handle_clear_report_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обрабатывает подтверждение очистки отчета."""
+    query = update.callback_query
+    if not query or not query.from_user or not query.data: return
+    user_id = query.from_user.id
+    if not is_admin(user_id): await query.answer("❌ Доступ запрещен.", show_alert=True); return
+    if query.data == 'confirm_clear_report':
+        shipment_count = len(context.bot_data.get('shipments', {}))
+        context.bot_data['shipments'] = {}
+        logger.info(f"Администратор {user_id} очистил отчет по грузам. Удалено {shipment_count} записей.")
+        await query.edit_message_text(f"✅ Отчет по грузам успешно очищен. Удалено {shipment_count} записей.")
+    elif query.data == 'cancel_clear_report':
+        await query.edit_message_text("❌ Очистка отчета отменена.")
+
+commission_rejection_conv_handler = ConversationHandler(
+    entry_points=[CallbackQueryHandler(commission_ask_rejection_reason, pattern=r'^commact_.*_rejectreason$')],
+    states={ States.AWAITING_REJECTION_REASON: [MessageHandler(filters.TEXT & ~filters.COMMAND, commission_handle_rejection_reason)], },
+    fallbacks=[CommandHandler('cancel_reason', cancel_rejection_reason), CommandHandler('cancel', cancel)],
+    per_user=True, per_message=False )
+
+# --- Основная функция запуска бота ---
+async def main() -> None:
+    bot_token = os.getenv('TELEGRAM_BOT_TOKEN') # Сначала пытаемся из окружения
+    if not bot_token:
+        bot_token = '7336851514:AAHHzJch7iatWZN2xHJpbck61zwoJY7m74w' # ЗАМЕНИТЕ ЭТО НА ВАШ АКТУАЛЬНЫЙ ТОКЕН
+        if bot_token == 'ВАШ_ТЕЛЕГРАМ_БОТ_ТОКЕН' or not bot_token:
+            logger.critical("Токен бота НЕ УСТАНОВЛЕН! Укажите его в коде или через переменную окружения TELEGRAM_BOT_TOKEN.")
+            exit(1)
+        else:
+            logger.warning("Токен бота используется из кода. Для безопасности рекомендуется использовать переменную окружения.")
+
+    persistence_obj = PicklePersistence(filepath=f"{FILE_PREFIX}bot_persistence_data.pkl") # Используем FILE_PREFIX
+    app_builder = Application.builder().token(bot_token).persistence(persistence_obj)
+    app = app_builder.build() # Renamed
+
+    app.add_handler(commission_rejection_conv_handler)
+
+    # CommandHandlers
+    app.add_handler(CommandHandler('start', start))
+    app.add_handler(CommandHandler('register', start)) 
+    app.add_handler(CommandHandler('users', view_users, filters=filters.User(ADMIN_IDS))) # Только Супер Админ
+    # view_questions удален
+    app.add_handler(CommandHandler('commissions', view_commission_members_from_config, filters=filters.User(ADMIN_IDS))) # Только Супер Админ
+    app.add_handler(CommandHandler('report', generate_cargo_report, filters=filters.User(ADMIN_IDS))) # Только Супер Админ
+    app.add_handler(CommandHandler('clear_report', clear_cargo_report_command, filters=filters.User(ADMIN_IDS))) # Только Супер Админ
+    app.add_handler(CommandHandler('cancel', cancel)) 
+
+    # CallbackQueryHandlers
+    app.add_handler(CallbackQueryHandler(handle_registration_choice, pattern=r'^(start_register|cancel_register)$'))
+    app.add_handler(CallbackQueryHandler(handle_reception_type_choice, pattern=r'^reception_type_'))
+    app.add_handler(CallbackQueryHandler(handle_goods_subtype_choice, pattern=r'^goods_subtype_'))
+    app.add_handler(CallbackQueryHandler(handle_photo_choice, pattern=r'^(add_more_photos|finish_photos)$'))
+    app.add_handler(CallbackQueryHandler(handle_clear_report_confirmation, pattern=r'^(confirm_clear_report|cancel_clear_report)$'))
+    app.add_handler(CallbackQueryHandler(handle_docs, pattern=r'^(add_docs|send_now|doc_\d+|finish_and_send|confirm_send|cancel_send)$'))
+    app.add_handler(CallbackQueryHandler(get_document_handler, pattern=r'^getdoc_'))
+    app.add_handler(CallbackQueryHandler(handle_commission_sign_act, pattern=r'^commact_.*_sign$'))
+    # commission_ask_rejection_reason (точка входа для ConversationHandler) уже добавлен выше
+    app.add_handler(CallbackQueryHandler(handle_delete_shipment, pattern=r'^delshipment_'))
+    app.add_handler(CallbackQueryHandler(handle_cargo_action, pattern=r'^cargoaction_')) 
+    app.add_handler(CallbackQueryHandler(show_detailed_cargo_table_callback, pattern=r'^show_detailed_cargo_table$'))
+    app.add_handler(CallbackQueryHandler(download_full_report_handler, pattern=r'^download_full_report$'))
+
+    # MessageHandlers
+    app.add_handler(MessageHandler(filters.PHOTO & (~filters.COMMAND), handle_photo)) # Обработка фото
+    app.add_handler(MessageHandler(filters.Document.ALL & (~filters.COMMAND), handle_docs)) # Обработка документов
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
+    app.add_error_handler(error_handler)
+
+    await app.initialize() # Инициализируем приложение
+
+    logger.info("Запуск бота...")
+    # Запускаем бота в неблокирующем режиме.
+    await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+    await app.start()
+    
+    # Бот будет работать до принудительной остановки (Ctrl+C)
+    try:
+        while True:
+            await asyncio.sleep(1)
+    except KeyboardInterrupt:
+        logger.info("Остановка бота...")
+    finally:
+        await app.stop()
+        await app.updater.stop()
+
+if __name__ == '__main__':
+    asyncio.run(main())
